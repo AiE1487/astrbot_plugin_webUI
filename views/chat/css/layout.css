@@ -1,0 +1,486 @@
+/**
+ * layout.css — 应用外壳三栏布局（开发计划 §6.2 布局图）。
+ *
+ * 网格：
+ *   顶栏 56px（跨全宽）
+ *   行 2：侧栏 280px | 消息流列（内部 max-860 居中） | 右轨 64px
+ *   行 3：输入区（跨 消息流列 + 右轨；侧栏保持通高）
+ * 动效（§6.3，纯 CSS）：加载屏淡出 400ms；侧栏折叠 160ms。
+ */
+
+#app {
+  display: grid;
+  grid-template-columns: var(--sidebar-w) minmax(0, 1fr) var(--rail-w);
+  grid-template-rows: var(--topbar-h) minmax(0, 1fr) auto;
+  grid-template-areas:
+    "topbar topbar topbar"
+    "sidebar main rail"
+    "sidebar composer rail";
+  height: 100vh;
+  height: 100dvh;
+  width: 100%;
+  opacity: 0;
+  transition: opacity var(--t-slow) var(--ease-out);
+}
+
+#app.app-ready {
+  opacity: 1;
+}
+
+/* 窄视口降级：右轨隐藏、侧栏改为浮层 */
+@media (max-width: 900px) {
+  #app {
+    grid-template-columns: var(--sidebar-w) minmax(0, 1fr);
+    grid-template-areas:
+      "topbar topbar"
+      "sidebar main"
+      "sidebar composer";
+  }
+
+  #right-rail {
+    display: none;
+  }
+}
+
+/* ══ 顶栏 ══════════════════════════════════════════════ */
+
+#topbar {
+  grid-area: topbar;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 0 12px 0 14px;
+  background: linear-gradient(180deg, #161616 0%, var(--bg-panel) 100%);
+  border-bottom: 1px solid var(--line-border);
+  position: relative;
+  z-index: 30;
+}
+
+#topbar .brand {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+}
+
+#topbar .brand .brand-name {
+  font-family: var(--font-display);
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+#topbar .brand .brand-sub {
+  font-family: var(--font-mono-tag);
+  font-size: 9px;
+  letter-spacing: 0.2em;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+/* 当前人格名 + 青色下划线（§6.2 顶栏） */
+#persona-indicator {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1px;
+  max-width: 40vw;
+  pointer-events: none;
+}
+
+#persona-indicator .pi-label {
+  font-family: var(--font-mono-tag);
+  font-size: 8px;
+  letter-spacing: 0.3em;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+}
+
+#persona-indicator .pi-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 40vw;
+  padding: 0 2px 2px;
+  border-bottom: 2px solid var(--accent);
+}
+
+#topbar .topbar-spacer {
+  flex: 1;
+}
+
+#topbar .topbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* 图标按钮（icon-btn hover = 白 30% 底，observations §1） */
+.icon-btn {
+  width: 32px;
+  height: 32px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius);
+  color: var(--text-caption);
+  background: rgba(255, 255, 255, 0.1);
+  transition: background-color var(--t-fast) var(--ease-out), color var(--t-fast) var(--ease-out);
+}
+
+.icon-btn:hover {
+  background: rgba(255, 255, 255, 0.3);
+  color: var(--text-primary);
+}
+
+.icon-btn:disabled {
+  background: rgba(255, 255, 255, 0.04);
+}
+
+/* 连接状态点（成功 lime / 重连 warning / 断线 error） */
+.conn-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 26px;
+  padding: 0 8px;
+  border: 1px solid var(--line-border);
+  border-radius: var(--radius);
+  background: var(--bg-item);
+  font-family: var(--font-mono-tag);
+  font-size: 9px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--text-caption);
+  white-space: nowrap;
+}
+
+.conn-chip .conn-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--success);
+  flex: none;
+}
+
+.conn-chip.is-reconnecting .conn-dot {
+  background: var(--warning);
+  animation: conn-pulse 1.1s ease-in-out infinite;
+}
+
+.conn-chip.is-offline .conn-dot {
+  background: var(--error);
+}
+
+@keyframes conn-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.25; }
+}
+
+/* 语言切换（仅 standalone/mock 出现） */
+.locale-btn {
+  height: 26px;
+  padding: 0 8px;
+  border: 1px solid var(--line-border);
+  border-radius: var(--radius);
+  background: var(--bg-item);
+  font-family: var(--font-mono-tag);
+  font-size: 9px;
+  letter-spacing: 0.14em;
+  color: var(--text-caption);
+}
+
+.locale-btn:hover {
+  background: var(--accent-10);
+  color: var(--text-primary);
+}
+
+/* ══ 侧栏（外壳；内容样式在 components.css） ═══════════ */
+
+#sidebar {
+  grid-area: sidebar;
+  width: var(--sidebar-w);
+  background: var(--bg-panel);
+  border-right: 1px solid var(--line-border);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  position: relative;
+  z-index: 20;
+}
+
+/* 半调网点纹理（§6.2/observations §1-4）：侧栏/右轨装饰 */
+#sidebar {
+  background-image: radial-gradient(rgba(255, 255, 255, 0.05) 1px, transparent 1.4px);
+  background-size: 9px 9px;
+}
+
+/* 折叠：160ms 宽度过渡（§6.3） */
+#sidebar.sidebar-collapsed {
+  width: 0;
+  border-right-width: 0;
+  transition: width var(--t-fast) var(--ease-out);
+}
+
+#sidebar {
+  transition: width var(--t-fast) var(--ease-out);
+}
+
+#sidebar .sidebar-inner {
+  width: var(--sidebar-w);
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+/* ══ 主列（消息流容器） ═════════════════════════════════ */
+
+#chat-column {
+  grid-area: main;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  background: var(--bg-page);
+  position: relative;
+}
+
+/* 断线重连 / 流式不可用横幅插槽 */
+#banner-slot {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 10;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 10px 0;
+  pointer-events: none;
+}
+
+#banner-slot > * {
+  pointer-events: auto;
+}
+
+/* 消息滚动容器（内部 .message-flow max-860 居中在 chat.css） */
+#chat-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  scroll-behavior: auto;
+}
+
+/* 会话切换：200ms 淡入 + 8px 上移（§6.3） */
+#chat-scroll .switch-enter {
+  animation: switch-in var(--t-med) var(--ease-out);
+}
+
+@keyframes switch-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* ══ 右轨 ══════════════════════════════════════════════ */
+
+#right-rail {
+  grid-area: rail;
+  background: var(--bg-panel);
+  border-left: 1px solid var(--line-border);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  overflow: hidden;
+  position: relative;
+}
+
+/* 大号青色会话编号 01 / ∞（§6.2 + observations §1-2） */
+#right-rail .rail-num {
+  font-family: var(--font-display);
+  font-size: 34px;
+  font-weight: 700;
+  line-height: 1;
+  color: var(--accent);
+  letter-spacing: 0.02em;
+}
+
+#right-rail .rail-total {
+  font-family: var(--font-mono-tag);
+  font-size: 9px;
+  letter-spacing: 0.2em;
+  color: var(--text-secondary);
+}
+
+#right-rail .rail-label {
+  font-family: var(--font-mono-tag);
+  font-size: 8px;
+  letter-spacing: 0.26em;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  margin-top: 8px;
+  writing-mode: vertical-rl;
+}
+
+#right-rail .rail-deco {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+}
+
+#right-rail .rail-content {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+}
+
+/* ══ 输入区（外壳；内容样式在 components.css） ═════════ */
+
+#composer {
+  grid-area: composer;
+  background: var(--bg-panel);
+  border-top: 1px solid var(--line-border);
+  min-height: 0;
+}
+
+/* ══ 加载屏（§6.3 / observations §1-5） ════════════════ */
+
+#loading-screen {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  background: var(--bg-loading);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  transition: opacity var(--t-slow) var(--ease-out), visibility var(--t-slow);
+}
+
+#loading-screen.is-done {
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+}
+
+#loading-screen .ls-logo {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 96px;
+}
+
+#loading-screen .ls-logo img,
+#loading-screen .ls-logo svg {
+  width: 168px;
+  height: auto;
+  opacity: 0.92;
+}
+
+#loading-screen .ls-logo .ls-sub {
+  font-family: var(--font-mono-tag);
+  font-size: 10px;
+  letter-spacing: 0.42em;
+  text-transform: uppercase;
+  color: var(--text-caption);
+  padding: 3px 10px 3px 13px;
+  border: 1px solid var(--line-divider);
+}
+
+/* 通长进度条：底轨灰白、进度段青（observations §1-5） */
+#loading-screen .ls-bar {
+  position: absolute;
+  left: 4vw;
+  right: 4vw;
+  bottom: 18vh;
+  height: 6px;
+  background: rgba(255, 255, 255, 0.25);
+  overflow: hidden;
+}
+
+#loading-screen .ls-bar .ls-bar-fill {
+  height: 100%;
+  width: 0%;
+  background: var(--accent-strong);
+  transition: width 240ms var(--ease-out);
+}
+
+#loading-screen .ls-status {
+  position: absolute;
+  left: 50%;
+  transform: translateX(-50%);
+  bottom: calc(18vh - 34px);
+  font-family: var(--font-mono-tag);
+  font-size: 12px;
+  letter-spacing: 0.18em;
+  color: var(--text-caption);
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+#loading-screen .ls-corner {
+  position: absolute;
+  bottom: 22px;
+  font-family: var(--font-mono-tag);
+  font-size: 11px;
+  letter-spacing: 0.16em;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+}
+
+#loading-screen .ls-left {
+  left: 24px;
+}
+
+#loading-screen .ls-right {
+  right: 24px;
+  color: var(--text-caption);
+}
+
+/* ══ 全屏遮罩层通用（对话框/灯箱/登录，样式在 components.css） ══ */
+
+.overlay-root {
+  position: fixed;
+  inset: 0;
+  z-index: 90;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--mask);
+  animation: overlay-in var(--t-fast) var(--ease-out);
+}
+
+.overlay-root.overlay-deep {
+  background: var(--mask-deep);
+}
+
+@keyframes overlay-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}

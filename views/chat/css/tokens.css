@@ -1,0 +1,197 @@
+/**
+ * tokens.css — 设计 token 全量落地（UserPlan/开发计划.md §6.1 + ref-site/observations.md §1）。
+ *
+ * 规则（R5）：只复刻风格 token 与布局语言，不引用参考站任何素材/字体文件；
+ * Bender / SDK_Sans 用系统字体栈模拟军事感（--font-display / --font-mono-tag）。
+ * 交互态（observations §1 / 计划 §6.1）：
+ *   按钮 hover = 主色 80% 透明底；卡片 hover = 主色 10% 透明底；
+ *   图标按钮 hover = 白 30% 底；输入 focus 边框 = 主色。
+ */
+
+:root {
+  /* ── 底色三级（深色表面） ─────────────────────────────── */
+  --bg-page: #0d0d0d;                       /* 页面底 */
+  --bg-panel: #191919;                      /* 侧栏/输入区/面板标题 */
+  --bg-card: #282828;                       /* 消息卡片 */
+  --bg-item: rgba(255, 255, 255, 0.05);     /* 条目底 */
+  --bg-loading: #1e1e1e;                    /* 加载屏底（observations §1） */
+
+  /* ── 主色与功能色 ─────────────────────────────────────── */
+  --accent: #0098dc;                        /* 青：主操作/高亮/进度/编号 */
+  --accent-strong: #00b0ff;                 /* 高频青色辅助（亮态） */
+  --accent-soft: rgba(0, 152, 220, 0.12);   /* 浅青底（工具结果/选中底） */
+  --accent-80: rgba(0, 152, 220, 0.8);      /* 主按钮 hover（主色 80% 透明） */
+  --accent-10: rgba(0, 152, 220, 0.1);      /* 卡片 hover（主色 10% 透明） */
+  --accent-line: rgba(0, 152, 220, 0.6);    /* 输入 focus 边框 */
+  --brand-lime: #cbff40;                    /* 次强调：成功/在线/busy 呼吸点 */
+  --lime-80: rgba(203, 255, 64, 0.8);       /* lime 按钮 hover */
+  --lime-10: rgba(203, 255, 64, 0.1);
+  --error: #f96f68;
+  --warning: #f5a623;
+  --success: #48d2a0;
+
+  /* ── 文字 ─────────────────────────────────────────────── */
+  --text-primary: #ffffff;
+  --text-caption: #d4d8dd;
+  --text-secondary: #9b9b9b;
+  --text-tertiary: #bbbbbb;
+  --text-disabled: #787878;                 /* 仅禁用态（§6.3 注意） */
+  --text-highlight: #cbff40;
+
+  /* ── 线与遮罩 ─────────────────────────────────────────── */
+  --line-border: rgba(255, 255, 255, 0.1);
+  --line-divider: rgba(255, 255, 255, 0.3);
+  --line-hover: #cbff40;
+  --mask: rgba(0, 0, 0, 0.4);
+  --mask-deep: rgba(0, 0, 0, 0.72);         /* 灯箱/登录层加深 */
+
+  /* ── 字体（不捆绑任何字体文件，R5） ───────────────────── */
+  --font-display: "Saira Condensed", "Rajdhani", "Arial Narrow", system-ui, sans-serif;
+  --font-body: system-ui, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  --font-mono-tag: ui-monospace, Consolas, "Courier New", monospace;
+
+  /* ── 布局度量（§6.2） ─────────────────────────────────── */
+  --topbar-h: 56px;
+  --sidebar-w: 280px;
+  --flow-max: 860px;                        /* 消息流最大宽度 */
+  --rail-w: 64px;                           /* 右轨宽度 */
+
+  /* ── 动效（§6.3：纯 CSS transition，禁 JS 动画库） ────── */
+  --ease-out: cubic-bezier(0.22, 0.61, 0.36, 1);
+  --t-fast: 160ms;                          /* 侧栏折叠 */
+  --t-med: 200ms;                           /* 会话切换淡入 + 8px 上移 */
+  --t-slow: 400ms;                          /* 加载屏淡出 */
+
+  /* ── 组件尺寸 ─────────────────────────────────────────── */
+  --radius: 4px;                            /* 方舟风整体偏硬朗，小圆角 */
+  --radius-lg: 8px;
+}
+
+/* ── 基础 reset 与全局 ─────────────────────────────────── */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+}
+
+body {
+  background: var(--bg-page);
+  color: var(--text-primary);
+  font-family: var(--font-body);
+  font-size: 14px;
+  line-height: 1.6;
+  overflow: hidden;                         /* 滚动交给内部容器 */
+  -webkit-font-smoothing: antialiased;
+}
+
+button,
+input,
+textarea,
+select {
+  font: inherit;
+  color: inherit;
+}
+
+button {
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: not-allowed;
+  color: var(--text-disabled);
+}
+
+img {
+  max-width: 100%;
+}
+
+/* 键盘可达性：focus 主色描边 */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* ── 滚动条（深色细轨） ────────────────────────────────── */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.18) transparent;
+}
+
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+*::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.18);
+  border-radius: 4px;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.3);
+}
+
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* ── 半调网点纹理（observations §1-4；radial-gradient 点阵） ── */
+.halftone {
+  background-image: radial-gradient(rgba(255, 255, 255, 0.07) 1px, transparent 1.4px);
+  background-size: 9px 9px;
+}
+
+/* 边缘密、中心疏：mask 渐隐（叠加在 .halftone 上使用） */
+.halftone-fade {
+  -webkit-mask-image: radial-gradient(ellipse at center, transparent 0%, #000 100%);
+  mask-image: radial-gradient(ellipse at center, transparent 0%, #000 100%);
+}
+
+/* ── 等宽军事感标签（工具调用/编号/时间戳，observations §3） ── */
+.mono-tag {
+  font-family: var(--font-mono-tag);
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+
+/* 展示字体（编号/空态大字） */
+.display-font {
+  font-family: var(--font-display);
+  letter-spacing: 0.06em;
+}
+
+/* 图标基元（icons.js 注入内联 SVG，随 currentColor 着色） */
+.icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+}
+
+.icon svg {
+  display: block;
+}
+
+/* 视觉隐藏（a11y 文本） */
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}

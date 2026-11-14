@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 340 64" role="img" aria-label="astrbot_plugin_webui">
+  <!-- 自绘横版 logo（加载屏用）：与 logo-mark.svg 同一图形 + 等宽字标 -->
+  <polygon points="32,4 56,17.5 56,46.5 32,60 8,46.5 8,17.5" fill="none" stroke="#0098DC" stroke-width="3"/>
+  <polygon points="32,10.5 50.5,21 50.5,43 32,53.5 13.5,43 13.5,21" fill="rgba(0,152,220,0.08)" stroke="none"/>
+  <path d="M21 25.5 28.5 32 21 38.5" fill="none" stroke="#CBFF40" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="32" y="36.6" width="12" height="3.4" fill="#0098DC"/>
+  <text x="72" y="38" font-family="Consolas, ui-monospace, monospace" font-size="26" letter-spacing="4" fill="#FFFFFF">WEBUI</text>
+  <text x="176" y="38" font-family="Consolas, ui-monospace, monospace" font-size="26" letter-spacing="4" fill="#0098DC">//</text>
+  <text x="212" y="38" font-family="Consolas, ui-monospace, monospace" font-size="26" letter-spacing="4" fill="#FFFFFF">CONSOLE</text>
+  <text x="73" y="54" font-family="Consolas, ui-monospace, monospace" font-size="9" letter-spacing="3" fill="#9B9B9B">ASTRBOT PLUGIN VIEW</text>
+</svg>

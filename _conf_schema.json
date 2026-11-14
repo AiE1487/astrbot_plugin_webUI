@@ -1,0 +1,64 @@
+{
+  "standalone_enabled": {
+    "description": "启用独立端口页面",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后插件额外监听一个 HTTP 端口（默认 http://127.0.0.1:6186/），提供与 Dashboard 内嵌视图相同界面的独立访问入口；关闭时仅能从 WebUI 的插件视图进入（启动日志会注明当前入口状态）。修改后需重载插件生效。"
+  },
+  "standalone_port": {
+    "description": "独立端口监听端口",
+    "type": "int",
+    "default": 6186,
+    "hint": "独立端口页监听的端口号；若与已安装的其他端口类插件冲突可修改。修改后需重载插件生效。"
+  },
+  "standalone_password": {
+    "description": "独立端口访问密码",
+    "type": "string",
+    "secret": true,
+    "default": "",
+    "hint": "留空时独立端口仅允许 127.0.0.1 本机访问；设置后需凭密码登录。配置文件中仍为明文，请勿外传。"
+  },
+  "max_concurrent_generations": {
+    "description": "全局并发生成上限",
+    "type": "int",
+    "default": 2,
+    "slider": {
+      "min": 1,
+      "max": 8,
+      "step": 1
+    },
+    "hint": "同一时刻整个插件允许进行的最大流式生成数；同一会话同时只允许一个生成任务，超出上限的新发送请求会被拒绝并提示。"
+  },
+  "upload_image_max_mb": {
+    "description": "图片上传大小上限（MB）",
+    "type": "int",
+    "default": 20,
+    "hint": "单张图片上传的最大体积；宿主侧另有 64MB 硬上限，前端发送前会压缩到长边不超过 2048。"
+  },
+  "upload_text_max_kb": {
+    "description": "文本附件大小上限（KB）",
+    "type": "int",
+    "default": 200,
+    "hint": "单个文本附件读入 prompt 的最大体积，超出部分会被截断并在界面上提示。"
+  },
+  "show_reasoning_default": {
+    "description": "思考内容默认展开",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后历史消息中的思考内容（reasoning）区块默认展开显示；流式期间始终自动展开、完成后自动收起。"
+  },
+  "attachment_text_whitelist": {
+    "description": "文本附件后缀白名单",
+    "type": "list",
+    "default": ["txt", "md", "json", "csv", "py"],
+    "hint": "允许作为文本内容注入 prompt 的文件后缀（不含点号，小写）；不在白名单内的文件会被拒收，图片走单独的通道。"
+  },
+  "tool_loop_mode": {
+    "description": "工具调用循环模式",
+    "type": "string",
+    "options": ["stream", "loop_agent"],
+    "labels": ["流式自管工具循环", "宿主逐步循环（降级）"],
+    "default": "stream",
+    "hint": "stream：插件自实现流式工具循环，正文保持流式（方案 A，需 M3 真机探测可行）；loop_agent：带工具的会话降级为宿主 tool_loop_agent 逐步执行，正文非流式但步骤事件齐全（方案 B 保底）。修改后需重载插件生效。"
+  }
+}
