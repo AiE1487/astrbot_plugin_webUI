@@ -3,8 +3,9 @@ display_name: 酒馆风对话 WebUI
 short_desc: 类 SillyTavern 风格的 AstrBot 对话 WebUI，双入口、流式回复、人格选择。
 desc: 在 AstrBot WebUI 中提供类 SillyTavern（酒馆）风格的对话视图 —— 人格选择、流式回复、
   思考与工具调用展示、附件对话；Dashboard 内嵌视图与独立端口页双入口，单用户共享会话池。
-  直调 Provider 自管人格与历史，不走内置 WebChat 消息管道。
-version: v0.1.1
+  插件只做前端与传输，对话全托管宿主管道（webchat 队列注入 + back_queue 消费），
+  工具调用、记忆、RAG 等管道插件照常生效。
+version: v0.2.0
 author: AiE1487
 repo: https://github.com/AiE1487/astrbot_plugin_webUI
 astrbot_version: ">=4.29,<5"

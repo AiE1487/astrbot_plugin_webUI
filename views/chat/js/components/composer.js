@@ -195,6 +195,11 @@ export function createComposer({ root, store, api, t }) {
 
   /** @param {File[]} files */
   async function addFiles(files) {
+    if (isLegacyConvo()) {
+      // legacy 归档只读：拖拽/粘贴等入口统一拦截（附件按钮已禁用）
+      toast(legacyNoticeText(), "warning");
+      return;
+    }
     const imageCapable = store.state.imageCapable;
     for (const file of files) {
       const ext = extOf(file.name);
@@ -244,7 +249,8 @@ export function createComposer({ root, store, api, t }) {
   function showDragState() {
     window.clearTimeout(dragHideTimer);
     root.classList.add("is-dragover");
-    setNote(t("composer.dropHint", "松开以添加附件"));
+    // legacy 只读会话：保留原说明条，不显示拖拽提示
+    if (!isLegacyConvo()) setNote(t("composer.dropHint", "松开以添加附件"));
   }
 
   /** @param {boolean} [immediate] */
@@ -297,6 +303,7 @@ export function createComposer({ root, store, api, t }) {
     "aria-label": t("composer.attach", "添加附件"),
     title: t("composer.attach", "添加附件"),
     onclick: () => {
+      if (isLegacyConvo()) return; // legacy 归档只读：上传入口禁用（防御性短路）
       // image_capable=false → accept 收窄为文本白名单（启发式预禁图片入口）
       const accepts = store.state.imageCapable
         ? [...IMAGE_EXTS, ...TEXT_EXTS].map((ext) => `.${ext}`).join(",")
@@ -336,9 +343,23 @@ export function createComposer({ root, store, api, t }) {
     foot.classList.toggle("has-note", Boolean(text));
   }
 
+  /* ── legacy 归档会话（v1.1 可选字段 legacy:true）：只读 ── */
+
+  /** @returns {boolean} 当前会话是否为 legacy 只读归档 */
+  function isLegacyConvo() {
+    return Boolean(store.conversationOf(store.state.currentCid)?.legacy);
+  }
+
+  /** @returns {string} legacy 说明条文案 */
+  function legacyNoticeText() {
+    return t("composer.legacyNotice", "旧版会话为只读归档，无法继续对话");
+  }
+
   /* ── 发送 / 停止 ────────────────────────────────────── */
 
   let sending = false;
+  /** legacy 说明条是否正由本组件展示（切走会话时据此判断是否需要清空脚注） */
+  let legacyNoteShown = false;
 
   function attachmentsReady() {
     for (const item of pending.values()) {
@@ -348,6 +369,7 @@ export function createComposer({ root, store, api, t }) {
   }
 
   function canSend() {
+    if (isLegacyConvo()) return false; // legacy 归档只读：禁发
     const cid = store.state.currentCid;
     if (sending || !attachmentsReady()) return false;
     if (cid && store.isBusy(cid)) return false; // busy 禁发
@@ -358,7 +380,18 @@ export function createComposer({ root, store, api, t }) {
 
   function updateButtons() {
     sendBtn.disabled = !canSend();
-    textarea.disabled = false;
+    // legacy 归档只读：输入区与上传入口一并禁用（发送按钮经 canSend 已禁）
+    const legacy = isLegacyConvo();
+    textarea.disabled = legacy;
+    attachBtn.disabled = legacy;
+    // 说明条：选中 legacy 会话时显示；切走时若脚注仍是该说明则清空（不覆盖其它提示）
+    if (legacy) {
+      setNote(legacyNoticeText(), "warning");
+      legacyNoteShown = true;
+    } else if (legacyNoteShown) {
+      legacyNoteShown = false;
+      if (noteNode.textContent === legacyNoticeText()) setNote("");
+    }
     // 流式态：有订阅中的流（正常/降级重试）或存在活跃 gen_id（降级轮询模式，
     // 无流式状态但有可停止的生成，契约 stop/<gen_id> 仍可用）
     const currentCid = store.state.currentCid;
@@ -450,6 +483,11 @@ export function createComposer({ root, store, api, t }) {
     sendBtn.setAttribute("title", t("composer.send", "发送"));
     stopBtn.setAttribute("aria-label", t("composer.stop", "停止"));
     stopBtn.setAttribute("title", t("composer.stop", "停止"));
+    // 语言切换后刷新 legacy 说明条文案
+    if (legacyNoteShown) {
+      if (isLegacyConvo()) setNote(legacyNoticeText(), "warning");
+      else legacyNoteShown = false;
+    }
   }
 
   return { onStoreChange, renderTexts, focus: () => textarea.focus() };

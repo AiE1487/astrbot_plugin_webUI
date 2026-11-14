@@ -231,6 +231,12 @@ export function createMessageFlow({ scrollEl, store, api, transport, t, onPinned
       card.appendChild(el("div", { class: "msg-text" }, textNode, textCursor));
     }
 
+    // 附件（v1.1：助手消息 attachments[] 与用户消息同构，渲染路径角色无关，
+    // 复用同一 buildAttachment / .msg-attachments 样式，容器内左对齐见 CSS）
+    if (Array.isArray(msg.attachments) && msg.attachments.length > 0) {
+      card.appendChild(el("div", { class: "msg-attachments" }, ...msg.attachments.map(buildAttachment)));
+    }
+
     // 工具面板（历史与流式共用；M3 ⑤ 分页 prepend 同样渲染 tools）
     /** @type {Map<string, {update: Function}>} */
     const panels = new Map();

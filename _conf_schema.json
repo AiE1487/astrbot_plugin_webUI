@@ -39,7 +39,7 @@
     "description": "文本附件大小上限（KB）",
     "type": "int",
     "default": 200,
-    "hint": "单个文本附件读入 prompt 的最大体积，超出部分会被截断并在界面上提示。"
+    "hint": "单个文本附件生成预览的最大体积，超出部分截断并在界面上提示（附件内容随消息交宿主管道处理）。"
   },
   "show_reasoning_default": {
     "description": "思考内容默认展开",
@@ -51,14 +51,6 @@
     "description": "文本附件后缀白名单",
     "type": "list",
     "default": ["txt", "md", "json", "csv", "py"],
-    "hint": "允许作为文本内容注入 prompt 的文件后缀（不含点号，小写）；不在白名单内的文件会被拒收，图片走单独的通道。"
-  },
-  "tool_loop_mode": {
-    "description": "工具调用循环模式",
-    "type": "string",
-    "options": ["stream", "loop_agent"],
-    "labels": ["流式自管工具循环", "宿主逐步循环（降级）"],
-    "default": "stream",
-    "hint": "stream：插件自实现流式工具循环，正文保持流式（方案 A，需 M3 真机探测可行）；loop_agent：带工具的会话降级为宿主 tool_loop_agent 逐步执行，正文非流式但步骤事件齐全（方案 B 保底）。修改后需重载插件生效。"
+    "hint": "允许作为附件上传的文件后缀（不含点号，小写）；不在白名单内的文件会被拒收，图片走单独的通道。附件内容拼接由宿主管道完成。"
   }
 }

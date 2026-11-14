@@ -12,11 +12,7 @@
     "upload_image_max_mb": { "description": "Image upload limit (MB)" },
     "upload_text_max_kb": { "description": "Text attachment limit (KB)" },
     "show_reasoning_default": { "description": "Expand reasoning blocks by default" },
-    "attachment_text_whitelist": { "description": "Text attachment extension whitelist" },
-    "tool_loop_mode": {
-      "description": "Tool loop mode",
-      "labels": ["Stream (self-managed loop)", "Host loop_agent (fallback)"]
-    }
+    "attachment_text_whitelist": { "description": "Text attachment extension whitelist" }
   },
   "views": {
     "chat": {
@@ -43,6 +39,7 @@
       "convo.untitled": "New chat",
       "convo.delete": "Delete conversation",
       "convo.busy": "busy",
+      "convo.legacyBadge": "Legacy",
       "dialog.deleteTitle": "Delete conversation",
       "dialog.deleteBody": "This permanently deletes \"{title}\" with its history and all attachments.\nContinue?",
       "dialog.cancel": "Cancel",
@@ -82,6 +79,7 @@
       "composer.uploadProgress": "Uploading {pct}%",
       "composer.dropHint": "Drop to add attachments",
       "composer.sending": "Sending…",
+      "composer.legacyNotice": "Legacy conversations are read-only archives.",
       "error.sessionBusy": "This conversation is already generating. Wait for it to finish or stop it first.",
       "error.concurrencyLimit": "Global concurrency limit reached. Try again later.",
       "error.payloadTooLarge": "File exceeds the upload size limit",

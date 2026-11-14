@@ -12,11 +12,7 @@
     "upload_image_max_mb": { "description": "单张图片上传上限（MB）" },
     "upload_text_max_kb": { "description": "文本附件注入上限（KB）" },
     "show_reasoning_default": { "description": "思考内容默认展开" },
-    "attachment_text_whitelist": { "description": "文本附件后缀白名单" },
-    "tool_loop_mode": {
-      "description": "工具循环模式",
-      "labels": ["流式（自管工具循环）", "宿主 loop_agent（兜底）"]
-    }
+    "attachment_text_whitelist": { "description": "文本附件后缀白名单" }
   },
   "views": {
     "chat": {
@@ -43,6 +39,7 @@
       "convo.untitled": "新会话",
       "convo.delete": "删除会话",
       "convo.busy": "生成中",
+      "convo.legacyBadge": "旧版",
       "dialog.deleteTitle": "删除会话",
       "dialog.deleteBody": "将删除「{title}」的权威历史、富历史与全部附件，且不可恢复。\n确认删除？",
       "dialog.cancel": "取消",
@@ -82,6 +79,7 @@
       "composer.uploadProgress": "上传中 {pct}%",
       "composer.dropHint": "松开以添加附件",
       "composer.sending": "发送中…",
+      "composer.legacyNotice": "旧版会话为只读归档，无法继续对话",
       "error.sessionBusy": "该会话正在生成回复，请等待完成或先停止",
       "error.concurrencyLimit": "全局并发已达上限，请稍后再试",
       "error.payloadTooLarge": "文件超过上传大小上限",

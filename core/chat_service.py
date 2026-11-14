@@ -1,31 +1,26 @@
-"""聊天服务：流式生成、任务表、abort、事件缓冲（M2）与附件/工具循环接线（M3）。
+"""聊天服务：流式生成任务表、SSE 事件缓冲、中止与生命周期（v0.2 生成内核）。
 
-UserPlan §2/§3.3（拍板）+ 对接契约 §SSE/§REST：
-- **直调 Provider** ``provider.text_chat_stream(...)``（流式唯一官方路径），自管
-  人格/历史；不走 webchat 管道。**text_chat_stream 只出现在本模块**（单一适配
-  层，R2；M3 工具循环经注入的 ``consume`` 闭包复用本模块的单轮消费）；
+契约（开发计划 §0.2 + 对接契约 §SSE/§REST）：
+- **生成内核 = webchat 队列注入 + back_queue 消费**（旧直调路径已废止）：
+  拼消息 parts（文本 plain + 媒体 attachment_id）-> pipeline_bridge 注入 ->
+  排水翻译 back_queue 载荷 -> ``_append_event`` 进 SSE 缓冲；会话管理、请求
+  拼接（人格/历史）、工具注入全部归还宿主管道（工具/记忆全生效）；
 - ``gen_id = uuid4 hex``；任务表 ``{gen_id: {task, buffer, cid, ...}}``；
   ``terminate()`` 时全部先落终态再 cancel；
 - 同会话 single-flight：发送前检查该 cid 是否有进行中任务，有则 409
   session_busy；全局并发上限实时读配置 ``max_concurrent_generations``，满则
   409 concurrency_limit；
-- 流式来源映射（§3.2）：chunk 的 ``result_chain`` = 文本增量；chunk 的
-  ``reasoning_content`` = 思考增量；末次 ``is_chunk=False`` 的完整响应含全量
-  ``completion_text`` / ``reasoning_content`` / ``usage`` -> done 事件
-  ``{message_id, usage}``；异常 -> error 事件 ``{fatal: true, code}``；
-- **stop 必须先向缓冲写终态 stopped 再 task.cancel()**（否则流永不关、重订阅
-  挂起）；未知/过期 gen_id -> 404（routes 映射）；
-- 事件缓冲保留 >=5 分钟（``BUFFER_TTL_SECONDS``，终态后仍可全量重放）；
-- 附件（M3）：图片路径直入 ``image_urls``（模型不支持在生成期抛错，无同步
-  判定，v4.29.4 provider.py L174 docstring 实证）-> 捕获后发 SSE
-  ``error{fatal:true, code:"model_not_multimodal"}``（错误分类为启发式，真机
-  核实后收紧）；文本附件按 ``<attachment name=...>`` 区块**拼接进 prompt**
-  （extra_user_content_parts 经 **kwargs 透传未证实，probe P4 探测项，落选
-  方案接受历史污染，README 已注明）；
-- 工具循环（M3）：方案 A/B 见 core/tool_loop.py；本模块注入单轮消费闭包与
-  事件通道，降级阶梯 A->B->无工具单轮（非致命 SSE error）；
-- 流式循环内不做阻塞 IO（富历史/权威历史写入在终态后进行，文件 IO 走
-  ``asyncio.to_thread``）。
+- SSE 事件（契约不变）：reasoning_delta/text_delta/tool_call/tool_result/
+  done{message_id,usage}/stopped/error；seq 从 0 单调、订阅即全量重放；
+- **stop 先落 stopped 终态**再 ``request_agent_stop_all(umo)`` 优雅中止，
+  **不再 cancel 消费任务**（等 end 帧自然收尾，部分回复照常落平台历史）；
+  未知/过期 gen_id -> 404（routes 映射）；
+- 每个 gen_id 的 finally **必须** ``remove_back_queue(gen_id)``（队列泄漏纪律）；
+- 排水循环的空闲超时兜底（120s）在 pipeline_bridge.consume_generation 内实现；
+- LLM 错误语义与官方 WebChat 一致：provider 错误以 bot 文本透传，插件侧仅对
+  传输层异常（注入失败/排水崩溃/空闲超时）写 error 终态；
+- 首条消息自动改题判定：平台历史 ``count(platform_id, user_id)==0``；
+- 流式循环内不做阻塞 IO（历史落库经宿主 db）。
 """
 
 import asyncio
@@ -35,27 +30,13 @@ import uuid
 from astrbot.api import logger
 from astrbot.api.star import Star
 
-from . import conversation_service, persona_service, sse, tool_loop, uistore
+from . import conversation_service, pipeline_bridge, sse
 
 BUFFER_TTL_SECONDS = 300.0  # 缓冲保留 >=5 分钟（契约 §SSE）
 
 # 任务表：{gen_id: {"gen_id", "cid", "task", "buffer", "waiters", "append_event",
 # "finished", "finished_at", "last_seq"}}
 _GENERATIONS: dict[str, dict] = {}
-
-# 多模态不支持错误启发式关键词（真机核实后收紧；契约允许最终裁决在生成期）
-_MULTIMODAL_HINTS = (
-    "image",
-    "multimodal",
-    "vision",
-    "visual",
-    "图片",
-    "图像",
-    "not support",
-    "unsupported",
-    "invalid content",
-    "content part",
-)
 
 
 class SendRejected(Exception):
@@ -126,12 +107,6 @@ def _concurrency_limit(plugin: Star) -> int:
     return max(1, int(plugin.config["max_concurrent_generations"]))
 
 
-def _tool_loop_mode(plugin: Star) -> str:
-    """实时读取工具循环模式（stream=方案 A / loop_agent=方案 B；非法值回 schema 默认）。"""
-    mode = str(plugin.config["tool_loop_mode"])
-    return mode if mode in ("stream", "loop_agent") else tool_loop.TOOL_LOOP_MODE
-
-
 def _active_count() -> int:
     """当前进行中（未终态）的生成任务数。"""
     return sum(1 for entry in _GENERATIONS.values() if not entry["finished"])
@@ -174,6 +149,18 @@ def _write_terminal(entry: dict, event_type: str, data: dict) -> dict | None:
     return body
 
 
+def _make_emit(entry: dict):
+    """构造排水翻译回调：业务事件进缓冲，终态事件幂等落终态标记。"""
+
+    def _emit(event: str, data: dict) -> None:
+        if event in ("done", "stopped", "error"):
+            _write_terminal(entry, event, data)
+        else:
+            _append_event(entry, event, data)
+
+    return _emit
+
+
 # ---------------------------------------------------------------------------
 # 发送 / 中止 / 订阅
 # ---------------------------------------------------------------------------
@@ -183,36 +170,33 @@ async def start_generation(
     plugin: Star,
     cid: str,
     text: str,
-    image_urls: list[str] | None = None,
-    attachment_blocks: list[str] | None = None,
-    attachment_meta: list[dict] | None = None,
+    media_parts: list[dict] | None = None,
+    attachment_metas: list[dict] | None = None,
 ) -> str:
     """创建并登记一次流式生成任务（POST send 的实现体）。
 
     Args:
-        plugin: 插件实例（取 context/provider 与 config）。
-        cid: 会话 id。
+        plugin: 插件实例（取 context 与 config）。
+        cid: 会话 id（= 宿主 platform_sessions.session_id）。
         text: 用户文本（可与附件二选一非空）。
-        image_urls: 图片本地路径列表（attachment_service 落盘后的绝对路径）。
-        attachment_blocks: 文本附件区块（``<attachment ...>``，拼进 prompt）。
-        attachment_meta: 契约附件元数据列表（写入富历史 user 消息 attachments）。
+        media_parts: 媒体 parts（routes 按附件索引解析，含 attachment_id/path）。
+        attachment_metas: 契约附件元数据（保留参数位，历史 attachments 反查
+            经插件索引进行，不再单独落库）。
 
     Returns:
         gen_id（uuid4 hex）。
 
     Raises:
-        ConversationNotFoundError: 会话不存在（-> 404）。
-        SessionBusyError: 该会话已有进行中任务（-> 409 session_busy）。
-        ConcurrencyLimitError: 超出全局并发上限（-> 409 concurrency_limit）。
+        SendRejected: 会话不存在（-> 404）/ session_busy（-> 409）/
+            concurrency_limit（-> 409）。
     """
     _sweep_expired()
     context = plugin.context
     data_dir = plugin.data_dir()
 
     # —— 同步段：检查与占位登记之间**无任何 await**，对事件循环原子（TOCTOU 修复）。
-    # 并发 send 到达时第二条必然看到第一条的占位条目，409 single-flight 与全局并发
-    # 上限在并发下不再失效；会话存在性等需要 await 的校验移到占位之后，失败时摘除
-    # 占位条目（gen_id 尚未返回给客户端，摘除无副作用）。
+    # 并发 send 到达时第二条必然看到第一条的占位条目；会话存在性等需要 await 的
+    # 校验移到占位之后，失败时摘除占位条目（gen_id 尚未返回给客户端，摘除无副作用）。
     if active_generation_id(cid) is not None:
         raise SessionBusyError()
     if _active_count() >= _concurrency_limit(plugin):
@@ -232,39 +216,19 @@ async def start_generation(
     }
     _GENERATIONS[gen_id] = entry  # 同步占位：此后该 cid 立即处于 single-flight 保护下
     try:
-        conv = await conversation_service.get_conversation(context, cid)
-        if conv is None:
-            raise conversation_service.ConversationNotFoundError(f"会话不存在: {cid}")
+        session = await pipeline_bridge.get_platform_session(context, cid)
+        if session is None or getattr(session, "creator", "") != pipeline_bridge.PLUGIN_CREATOR:
+            raise SendRejected(404, "not_found", f"会话不存在: {cid}")
 
-        umo = conversation_service.build_umo(cid)
-        persona = await persona_service.get_persona_for_conversation(context, umo, conv.persona_id)
-        contexts = await conversation_service.build_contexts(context, cid)
-
-        # 首条用户消息后自动改题（update_conversation_title 已废弃，改用 update_conversation）
-        if text.strip() and not await uistore.has_user_message(data_dir, cid):
-            try:
+        # 首条消息自动改题：判定数据源 = 平台历史 count==0（§0.2，注入前判定）
+        try:
+            if text.strip() and await pipeline_bridge.count_platform_history(context, cid) == 0:
                 await conversation_service.rename_conversation(context, cid, text)
-            except Exception as exc:  # noqa: BLE001 —— 改题失败不阻断发送
-                logger.warning(f"[webui] 自动改题失败（不阻断发送）cid={cid}: {exc}")
-
-        # 富历史先落用户消息（与生成成败无关，刷新后仍在；附件元数据同构契约）
-        await uistore.append_message(
-            data_dir,
-            cid,
-            {
-                "id": uistore.new_message_id(),
-                "role": "user",
-                "ts": uistore.now_iso(),
-                "text": text,
-                "attachments": list(attachment_meta or []),
-            },
-        )
+        except Exception as exc:  # noqa: BLE001 —— 改题失败不阻断发送
+            logger.warning(f"[webui] 自动改题失败（不阻断发送）cid={cid}: {exc}")
 
         entry["task"] = asyncio.create_task(
-            _run_generation(
-                plugin, entry, cid, text, image_urls or None, attachment_blocks or None,
-                attachment_meta or None, persona, contexts,
-            )
+            _run_generation(plugin, entry, cid, text, media_parts or [], data_dir)
         )
     except BaseException:
         # 校验失败/取消：摘除占位条目（task 尚未创建，无事件无订阅者）
@@ -275,237 +239,66 @@ async def start_generation(
     return gen_id
 
 
-async def _consume_round(
-    provider,
-    entry: dict,
-    *,
-    prompt: str,
-    image_urls: list[str] | None,
-    contexts: list[dict] | None,
-    system_prompt: str | None,
-    func_tool=None,
-    tool_calls_result=None,
-    text_parts: list[str] | None = None,
-    reasoning_parts: list[str] | None = None,
-):
-    """消费一轮 ``text_chat_stream``（**全插件唯一调用点**），产增量事件。
-
-    Args:
-        text_parts / reasoning_parts: 跨轮累加器（中止时拼接部分回复用）。
-
-    Returns:
-        末次完整响应（``is_chunk=False`` 的 LLMResponse）；缺失返回 None。
-    """
-    agen = provider.text_chat_stream(
-        prompt=prompt or None,
-        image_urls=image_urls or None,
-        contexts=contexts or None,
-        system_prompt=system_prompt,
-        func_tool=func_tool,
-        tool_calls_result=tool_calls_result,
-    )
-    final_resp = None
-    try:
-        async for chunk in agen:
-            if bool(getattr(chunk, "is_chunk", False)):
-                delta = _chain_text(getattr(chunk, "result_chain", None))
-                if delta:
-                    if text_parts is not None:
-                        text_parts.append(delta)
-                    _append_event(entry, "text_delta", {"delta": delta})
-                reasoning = getattr(chunk, "reasoning_content", None)
-                if reasoning:
-                    if reasoning_parts is not None:
-                        reasoning_parts.append(reasoning)
-                    _append_event(entry, "reasoning_delta", {"delta": reasoning})
-            else:
-                final_resp = chunk  # 末次完整响应（全量文本/usage/reasoning/工具调用）
-    finally:
-        aclose = getattr(agen, "aclose", None)
-        if aclose is not None:
-            try:
-                await aclose()
-            except Exception:  # noqa: BLE001 —— 清理失败不影响主流程
-                pass
-    return final_resp
-
-
 async def _run_generation(
     plugin: Star,
     entry: dict,
     cid: str,
     text: str,
-    image_urls: list[str] | None,
-    attachment_blocks: list[str] | None,
-    attachment_meta: list[dict] | None,
-    persona: dict | None,
-    contexts: list[dict],
+    media_parts: list[dict],
+    data_dir,
 ) -> None:
-    """生成任务体：消费 text_chat_stream -> SSE 事件 -> 终态 -> 历史双写。"""
+    """生成任务体：拼 parts -> webchat 注入 -> 排水翻译 -> 终态。
+
+    部分回复/异常历史由宿主 runner 与 pipeline_bridge.save_bot_history 负责，
+    本函数只管任务生命周期与 SSE 终态。
+    """
     gen_id = entry["gen_id"]
-    context = plugin.context
-    data_dir = plugin.data_dir()
-    text_parts: list[str] = []
-    reasoning_parts: list[str] = []
-    tool_steps: list[dict] = []
+    emit = _make_emit(entry)
     try:
-        provider = context.get_using_provider(umo=conversation_service.build_umo(cid))
-        if asyncio.iscoroutine(provider):
-            provider = await provider
-        if provider is None or not hasattr(provider, "text_chat_stream"):
-            raise RuntimeError("当前未配置可用的聊天模型提供商（provider）")
+        # 拼 parts：文本 plain + 媒体 attachment parts（宿主 build_webchat_message_parts
+        # 按 attachment_id 解析；path 供适配器定位文件，落库前由 bridge 剥除）
+        parts: list[dict] = []
+        if text.strip():
+            parts.append({"type": "plain", "text": text})
+        parts.extend(part for part in media_parts if isinstance(part, dict))
 
-        system_prompt = (persona or {}).get("prompt") or None
-        prompt = _build_prompt(text, attachment_blocks)
-        req_contexts = _with_begin_dialogs(persona, contexts)
-
-        consumed_final: object | None = None
-        toolset, tool_objs = tool_loop.build_toolset(plugin, persona)
-        if toolset is not None:
-            mode = _tool_loop_mode(plugin)
-
-            async def consume(**kwargs):
-                return await _consume_round(
-                    provider, entry, prompt=prompt, image_urls=image_urls,
-                    contexts=req_contexts, system_prompt=system_prompt,
-                    text_parts=text_parts, reasoning_parts=reasoning_parts, **kwargs,
-                )
-
-            try:
-                if mode == "loop_agent":
-                    consumed_final, tool_steps = await tool_loop.run_agent_loop(
-                        plugin, entry, umo=conversation_service.build_umo(cid),
-                        prompt=prompt, system_prompt=system_prompt,
-                        contexts=req_contexts, image_urls=image_urls, toolset=toolset,
-                    )
-                else:
-                    consumed_final, tool_steps = await tool_loop.run_stream_loop(
-                        plugin, entry, consume=consume, toolset=toolset, tool_objs=tool_objs,
-                    )
-            except tool_loop.ToolLoopUnavailable as exc:
-                if mode != "loop_agent":
-                    # 降级阶梯：方案 A 不可用 -> 方案 B -> 无工具单轮
-                    logger.warning(f"[webui] 方案 A 工具循环不可用，尝试降级方案 B: {exc}")
-                    _append_event(
-                        entry, "error",
-                        {"message": "流式工具循环不可用，改用宿主逐步执行（正文非流式）", "fatal": False},
-                    )
-                    try:
-                        consumed_final, tool_steps = await tool_loop.run_agent_loop(
-                            plugin, entry, umo=conversation_service.build_umo(cid),
-                            prompt=prompt, system_prompt=system_prompt,
-                            contexts=req_contexts, image_urls=image_urls, toolset=toolset,
-                        )
-                    except tool_loop.ToolLoopUnavailable as exc2:
-                        logger.warning(f"[webui] 方案 B 亦不可用，降级无工具单轮: {exc2}")
-                        _append_event(
-                            entry, "error",
-                            {"message": "工具调用暂不可用，已跳过工具继续生成", "fatal": False},
-                        )
-                        consumed_final = await consume(func_tool=None, tool_calls_result=None)
-                else:
-                    logger.warning(f"[webui] 方案 B 工具循环不可用，降级无工具单轮: {exc}")
-                    _append_event(
-                        entry, "error",
-                        {"message": "工具调用暂不可用，已跳过工具继续生成", "fatal": False},
-                    )
-                    consumed_final = await consume(func_tool=None, tool_calls_result=None)
-        else:
-            consumed_final = await _consume_round(
-                provider, entry, prompt=prompt, image_urls=image_urls,
-                contexts=req_contexts, system_prompt=system_prompt,
-                text_parts=text_parts, reasoning_parts=reasoning_parts,
-            )
-
-        completion = ""
-        reasoning_full = ""
-        signature = None
-        usage_raw = None
-        if consumed_final is not None:
-            completion = getattr(consumed_final, "completion_text", None) or ""
-            reasoning_full = getattr(consumed_final, "reasoning_content", None) or ""
-            signature = getattr(consumed_final, "reasoning_signature", None)
-            usage_raw = getattr(consumed_final, "usage", None)
-        if not completion:
-            completion = "".join(text_parts)
-        if not reasoning_full:
-            reasoning_full = "".join(reasoning_parts)
-        usage = _normalize_usage(usage_raw)
-
-        message_id = uistore.new_message_id()
-        assistant_msg: dict = {
-            "id": message_id,
-            "role": "assistant",
-            "ts": uistore.now_iso(),
-            "text": completion,
-            "usage": usage,
-        }
-        if reasoning_full:
-            reasoning_block = {"content": reasoning_full}
-            if signature:
-                reasoning_block["signature"] = signature
-            assistant_msg["reasoning"] = reasoning_block
-        if tool_steps:
-            assistant_msg["tools"] = tool_steps  # 富历史工具步骤（契约 §富历史）
-        # 历史先落盘、后发 done：done 即「已持久化」，前端刷新立即可见
-        await uistore.append_message(data_dir, cid, assistant_msg)
-        try:
-            await conversation_service.append_history_pair(context, cid, text, completion)
-        except Exception:  # noqa: BLE001 —— 权威历史失败不影响 SSE 终态
-            logger.exception(f"[webui] 权威历史写入失败 gen_id={gen_id} cid={cid}")
-
-        _write_terminal(entry, "done", {"message_id": message_id, "usage": usage})
+        injection = await pipeline_bridge.inject_user_message(
+            plugin.context, cid, parts, gen_id
+        )
+        await pipeline_bridge.consume_generation(
+            plugin.context,
+            cid,
+            gen_id,
+            injection["back_queue"],
+            injection["llm_checkpoint_id"],
+            emit,
+            data_dir=data_dir,
+            cid_bind=cid,
+        )
     except asyncio.CancelledError:
-        # stop 已先写终态；terminate/其他取消路径在此补终态（幂等）。
+        # 仅插件 terminate / 级联删除会取消消费任务（POST stop 不再取消）：
+        # stop 端点已先写终态；此处补终态（幂等）后上抛。
         _write_terminal(entry, "stopped", {"message": "已手动停止"})
-        partial = "".join(text_parts)
-        if partial:
-            try:
-                partial_msg: dict = {
-                    "id": uistore.new_message_id(),
-                    "role": "assistant",
-                    "ts": uistore.now_iso(),
-                    "text": partial,
-                    "stopped": True,
-                }
-                if tool_steps:
-                    partial_msg["tools"] = tool_steps
-                await uistore.append_message(data_dir, cid, partial_msg)
-                await conversation_service.append_history_pair(context, cid, text, partial)
-            except Exception:  # noqa: BLE001
-                logger.exception(f"[webui] 中止后的历史写入失败 gen_id={gen_id} cid={cid}")
         raise
-    except Exception as exc:  # noqa: BLE001 —— 生成异常 -> error 终态
-        logger.exception(f"[webui] 生成任务异常 gen_id={gen_id} cid={cid}")
-        message = str(exc) or type(exc).__name__
-        code = _classify_error(exc, bool(image_urls))
+    except pipeline_bridge.PipelineBridgeError as exc:
+        logger.exception(f"[webui] 管道注入失败 gen_id={gen_id} cid={cid}")
         _write_terminal(
             entry,
             "error",
-            {
-                "message": f"生成失败：{message}",
-                "fatal": True,
-                "code": code,
-            },
+            {"message": f"生成失败：{exc}", "fatal": True, "code": "server_error"},
         )
-        try:
-            await uistore.append_message(
-                data_dir,
-                cid,
-                {
-                    "id": uistore.new_message_id(),
-                    "role": "assistant",
-                    "ts": uistore.now_iso(),
-                    "text": "",
-                    "error": message,
-                    # 失败分类 slug 随占位持久化：刷新后前端可恢复专属文案与失败标记
-                    # （评审修复；契约富历史消息节的附加可选键，前端按可选字段消费）
-                    "error_code": code,
-                },
-            )
-        except Exception:  # noqa: BLE001
-            logger.exception(f"[webui] 失败占位消息写入失败 gen_id={gen_id} cid={cid}")
+    except Exception as exc:  # noqa: BLE001 —— 生成异常 -> error 终态
+        logger.exception(f"[webui] 生成任务异常 gen_id={gen_id} cid={cid}")
+        message = str(exc) or type(exc).__name__
+        _write_terminal(
+            entry,
+            "error",
+            {"message": f"生成失败：{message}", "fatal": True, "code": "server_error"},
+        )
     finally:
+        # 队列泄漏纪律：每个 gen_id 的 finally 必须 remove_back_queue（幂等；
+        # consume_generation 内部已清理，此处覆盖注入中途失败的路径）
+        pipeline_bridge.remove_back_queue(gen_id)
         # 防御：任何路径漏写终态时补一个（正常路径 finished 已为 True，幂等跳过）
         if not entry["finished"]:
             _write_terminal(
@@ -515,79 +308,17 @@ async def _run_generation(
             )
 
 
-def _build_prompt(text: str, attachment_blocks: list[str] | None) -> str:
-    """拼装本轮 prompt：用户文本 + 文本附件区块（文本为空时仅附件区块）。"""
-    joined = "\n\n".join(attachment_blocks or [])
-    if text.strip() and joined:
-        return f"{text}\n\n{joined}"
-    return text or joined
-
-
-def _classify_error(exc: Exception, had_images: bool) -> str:
-    """生成期错误分类（启发式；契约 slug，真机核实后收紧）。"""
-    if had_images:
-        lowered = f"{type(exc).__name__} {exc}".lower()
-        if any(hint in lowered for hint in _MULTIMODAL_HINTS):
-            return "model_not_multimodal"
-    return "server_error"
-
-
-def _with_begin_dialogs(persona: dict | None, contexts: list[dict]) -> list[dict]:
-    """人格 begin_dialogs 预置对话拼在权威历史前（与宿主 agent 行为一致）。"""
-    dialogs = (persona or {}).get("_begin_dialogs_processed") or []
-    prefix = [
-        {"role": d.get("role", "user"), "content": d.get("content", "")}
-        for d in dialogs
-        if isinstance(d, dict)
-    ]
-    return prefix + list(contexts or [])
-
-
-def _chain_text(chain) -> str:
-    """从 result_chain 提取本次文本增量（优先 MessageChain.get_plain_text）。"""
-    if chain is None:
-        return ""
-    get_plain = getattr(chain, "get_plain_text", None)
-    if callable(get_plain):
-        try:
-            return get_plain() or ""
-        except Exception:  # noqa: BLE001
-            pass
-    try:
-        return "".join(getattr(part, "text", "") or "" for part in chain)
-    except TypeError:
-        return ""
-
-
-def _normalize_usage(usage) -> dict:
-    """归一 usage 为契约形状 ``{"output": int, "total": int}``（缺失兜底 0）。"""
-    usage = usage if isinstance(usage, dict) else {}
-    output = usage.get("output")
-    if output is None:
-        output = usage.get("completion_tokens") or 0
-    total = usage.get("total")
-    if total is None:
-        input_tokens = usage.get("input")
-        if input_tokens is None:
-            input_tokens = usage.get("prompt_tokens") or 0
-        total = int(input_tokens or 0) + int(output or 0)
-    try:
-        return {"output": int(output or 0), "total": int(total or 0)}
-    except (TypeError, ValueError):
-        return {"output": 0, "total": 0}
-
-
-async def abort_generation(gen_id: str, wait: bool = True) -> bool:
+async def abort_generation(gen_id: str, wait: bool = False) -> bool:
     """中止生成任务（POST stop/<gen_id>）。
 
-    契约：**先向缓冲写终态 stopped 再 task.cancel()**（否则流永不关、重订阅
-    挂起）；gen_id 不存在或已结束返回 False（routes 映射 404）。
+    契约：**先向缓冲写终态 stopped**，再 ``request_agent_stop_all(umo)`` 优雅
+    中止（runner 保存部分历史、管道仍发 end 帧）；**不再 cancel 消费任务**，
+    排水循环继续到 end 帧后自然退出并 remove_back_queue；空闲超时兜底在
+    pipeline_bridge（120s 无载荷 -> error 终态并清理）。
+    gen_id 不存在或已结束返回 False（routes 映射 404）。
 
     Args:
-        wait: 默认 True——cancel 后等待任务收尾（吸收 CancelledError）再返回，
-            保证中止分支的部分回复/权威历史写入先于调用方的后续操作（如删除
-            会话的清理），杜绝「删除先行、中止分支随后写回」复活已删数据；
-            SSE 终态事件在 cancel 前已入缓冲，等待不影响订阅端及时收帧。
+        wait: 兼容保留参数（级联删除应改用 ``cancel_generation_tasks``）。
     """
     try:
         entry = _get_live_entry(gen_id)
@@ -596,14 +327,31 @@ async def abort_generation(gen_id: str, wait: bool = True) -> bool:
     if entry["finished"]:
         return False
     _write_terminal(entry, "stopped", {"message": "已手动停止"})
-    task = entry["task"]
-    if task is not None and not task.done():
-        task.cancel()
-        if wait:
-            await asyncio.gather(task, return_exceptions=True)
-    elif wait and task is not None:
-        await asyncio.gather(task, return_exceptions=True)
+    try:
+        pipeline_bridge.request_stop(pipeline_bridge.build_umo(entry["cid"]))
+    except pipeline_bridge.PipelineBridgeError as exc:
+        logger.warning(f"[webui] 优雅中止请求失败（任务仍会按超时兜底收尾）gen_id={gen_id}: {exc}")
     return True
+
+
+async def cancel_generation_tasks(cid: str, wait: bool = True) -> None:
+    """取消某会话的全部消费任务（级联删除专用，POST stop 不走此路径）。
+
+    先落终态 stopped 再 cancel，避免删除后排水任务又向平台历史写回数据。
+    """
+    _sweep_expired()
+    tasks: list[asyncio.Task] = []
+    for entry in list(_GENERATIONS.values()):
+        if entry["cid"] != cid:
+            continue
+        if not entry["finished"]:
+            _write_terminal(entry, "stopped", {"message": "会话已删除"})
+        task = entry["task"]
+        if task is not None and not task.done():
+            task.cancel()
+            tasks.append(task)
+    if wait and tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 async def replay_events(gen_id: str, after_seq: int = 0) -> list[dict]:
@@ -645,7 +393,8 @@ async def shutdown() -> None:
     """插件 terminate 清理：全部任务先落终态 stopped 再 cancel，并等待收尾。
 
     缓冲条目保留至 TTL（同进程重载前仍可重放）；重载会重新导入本模块，
-    任务表随之重置。
+    任务表随之重置。back_queue 清理由各任务的 finally（remove_back_queue）
+    保证，不漏队列。
     """
     for entry in list(_GENERATIONS.values()):
         if not entry["finished"]:

@@ -1,21 +1,40 @@
 #!/usr/bin/env python3
-"""M2 自测：stub 宿主下验证对话与流式全链路（UserPlan §7-M2 + 对接契约 v2）。
+"""selftest：stub 宿主下验证 v0.2「注入-排水」全链路（开发计划 §0.2/§0.3 + 对接契约）。
 
 遵循 astrbot-plugin-dev skill references/09 的「stub 宿主自测法」：
 
-- ``sys.path`` **先桩**（tests/stub 的假 astrbot 包）**后本体**（插件根目录，
+- ``sys.path`` **先桩**（tests/stub 的假 astrbot 包，含 webchat_queue_mgr /
+  active_event_registry / astrbot_path 三个宿主面桩）**后本体**（插件根目录，
   core/ 作为顶层包导入）；main.py 依赖真实宿主运行时注入，桩下不可导入，
   因此只测 core/；
-- M2 覆盖点：SSE 缓冲重放（幂等）、uistore 每 cid 原子写与分页、umo 构造、
-  配置默认值实时读取（并发上限热生效）、同会话 single-flight 409、abort 后
-  重订阅见 stopped 终态、历史双写一致、路由表精确注册、契约错误包形状；
-- 当前 core/ 无桩面（standalone 已于评审修复轮实现：鉴权/限速/token 纯逻辑见
-  L 组，start/stop 延迟导入 aiohttp，无 aiohttp 环境行为见 L-14）；
-  F 组保留空态骨架以备后续里程碑回填。
+- v0.2 覆盖点：
+  - A：SSE 事件封装 / seq 单调 / 缓冲重放（幂等）；
+  - B：uistore 只读归档层（读 / 分页 / list_archives / 清档）；
+  - C：umo 构造、cid/conv_id 双主键（new_conversation 的 umo 与注入 umo 逐字符
+    一致、get_conversation/update_conversation 经 conv_id）、会话 CRUD 映射宿主、
+    历史映射（plain 拼接 / think→reasoning / tool_call parts→tools / agent_stats→
+    usage / 媒体 parts→attachments 索引反查）、分页语义（page 1 最新、页内旧->新、
+    has_more 配 count）、legacy 归档响应附 legacy:true、级联/legacy 删除分支；
+  - D：生成内核「注入-排水」——注入三步形状（平台历史剥 path / back_queue /
+    会话队列 tuple / flags / checkpoint 同源）、翻译表逐型（text_delta /
+    reasoning_delta / tool_call{start} / tool_result{result|error 互斥 +
+    elapsed_ms} / agent_stats→done.usage / end→bot 落库→done{message_id,usage}）、
+    坏载荷防御（坏 JSON / 非 dict / message_id 不匹配 / 冗余帧不产事件）、
+    空闲超时兜底（注入短超时）、remove_back_queue 纪律（正常 / 异常 / 取消 /
+    shutdown）、stop 先落 stopped + request_agent_stop_all(umo) + 消费任务不被
+    cancel 且部分回复落平台历史、single-flight 409 / 并发上限 409（配置热生效）、
+    bot 媒体帧 db 注册 + 索引 + 助手 attachments（缺文件防御）、并发 send 竞态
+    （TOCTOU）、删除生成中会话（取消先行，已删历史不复活）；
+  - J6：SSE 保活 ping（不占业务 seq）；
+  - H：附件（宿主附件区落盘 + db 注册 + 索引 f_id↔attachment_id + 白名单 /
+    防穿越 / 413 / 截断 / 孤儿清理）；
+  - L：standalone 鉴权 / 限速 / token 纯逻辑；E/K：路由表精确注册、契约错误包、
+    send→注入→排水→done 端到端、附件端点与级联删除链路；
+  - F 组空态骨架保留。
 
 用法（工作区任意目录均可）::
 
-    .venv/bin/python.exe tests/selftest.py
+    .venv/bin/python.exe astrbot_plugin_webui/tests/selftest.py
 
 退出码：0 全部通过；1 有失败项。沙盒目录 tests/.sandbox-<pid>（按进程隔离，
 防并发运行互踩）每次运行前清空、结束（含失败）后删除；崩溃遗留的陈旧沙盒
@@ -53,10 +72,10 @@ import core.attachment_service as attachment_service  # noqa: E402
 import core.chat_service as chat_service  # noqa: E402
 import core.conversation_service as conversation_service  # noqa: E402
 import core.persona_service as persona_service  # noqa: E402
+import core.pipeline_bridge as pipeline_bridge  # noqa: E402
 import core.routes as routes  # noqa: E402
 import core.sse as sse  # noqa: E402
 import core.standalone as standalone  # noqa: E402
-import core.tool_loop as tool_loop  # noqa: E402
 import core.uistore as uistore  # noqa: E402
 from astrbot.api.web import (  # noqa: E402
     PluginUploadFile,
@@ -106,84 +125,29 @@ def sweep_stale_sandboxes(max_age_seconds: float = STALE_SANDBOX_MAX_AGE_SECONDS
 
 
 # ---------------------------------------------------------------------------
-# 桩宿主：假 provider / conversation_manager / persona_manager / context / plugin
+# 桩宿主：假 db / 会话与历史管理器 / persona_manager / context / plugin
+# （v0.2 注入-排水内核：webchat_queue_mgr / active_event_registry / astrbot_path
+# 三个宿主面由 tests/stub 桩模块提供；D 组用例以脚本化载荷驱动排水翻译）
 # ---------------------------------------------------------------------------
 
 
-class FakeChain:
-    """stub：MessageChain 等价物（get_plain_text 提取增量文本）。"""
-
-    def __init__(self, *texts: str) -> None:
-        self.texts = list(texts)
-
-    def get_plain_text(self) -> str:
-        return "".join(self.texts)
-
-
-def _chunk(text: str | None = None, reasoning: str | None = None) -> SimpleNamespace:
-    """流式增量 chunk（is_chunk=True）。"""
-    return SimpleNamespace(
-        is_chunk=True,
-        result_chain=FakeChain(text) if text is not None else None,
-        reasoning_content=reasoning,
-        completion_text=None,
-        reasoning_signature=None,
-        usage=None,
-    )
-
-
-def _final(
-    completion_text: str,
-    reasoning_content: str | None = None,
-    usage: dict | None = None,
-    reasoning_signature: str | None = None,
-) -> SimpleNamespace:
-    """末次完整响应（is_chunk=False）。"""
-    return SimpleNamespace(
-        is_chunk=False,
-        result_chain=FakeChain(completion_text),
-        reasoning_content=reasoning_content,
-        completion_text=completion_text,
-        reasoning_signature=reasoning_signature,
-        usage=usage,
-    )
-
-
-class FakeProvider:
-    """stub：text_chat_stream 适配层唯一触碰点（脚本化产出 chunk 序列）。"""
-
-    def __init__(self, scripts: list[list]) -> None:
-        self.scripts = list(scripts)
-        self.calls: list[dict] = []
-        self.gate: asyncio.Event | None = None  # 置位后慢速生成器才继续/收尾
-
-    def text_chat_stream(self, **kwargs):
-        self.calls.append(kwargs)
-        script = self.scripts.pop(0) if self.scripts else []
-        gate = self.gate
-        return self._gen(script, gate)
-
-    async def _gen(self, script: list, gate: asyncio.Event | None):
-        for item in script:
-            if isinstance(item, type(asyncio.Event())):  # 等待闸门（慢速模拟）
-                if gate is not None:
-                    await gate.wait()
-                continue
-            yield item
-
-
 class FakeConversationManager:
-    """stub：conversation_manager（内存会话表 + 调用记录）。"""
+    """stub：conversation_manager（内存会话表 + 调用记录；v0.2 双主键语义）。"""
 
     def __init__(self) -> None:
         self.convs: dict[str, SimpleNamespace] = {}
+        self.session_conversations: dict[str, str] = {}
         self.title_updates: list[tuple[str, str]] = []
         self.pairs: list[tuple[str, dict, dict]] = []
         self.deleted: list[str] = []
+        self.deleted_by_user: list[str] = []
+        self.new_calls: list[str] = []  # new_conversation 收到的 umo
+        self.get_calls: list[tuple[str, str]] = []  # get_conversation 收到的 (umo, conversation_id)
+        self.update_calls: list[tuple[str, str | None, str | None]] = []  # (umo, conversation_id, title)
 
     def seed(self, cid: str, persona_id: str | None = None, updated_at: int = 1000) -> SimpleNamespace:
         conv = SimpleNamespace(
-            platform_id="webui",
+            platform_id="webchat",
             user_id=conversation_service.build_umo(cid),
             cid=cid,
             history="[]",
@@ -197,11 +161,16 @@ class FakeConversationManager:
         return conv
 
     async def new_conversation(self, unified_msg_origin, platform_id=None, content=None, title=None, persona_id=None):
+        self.new_calls.append(unified_msg_origin)
         cid = uuid.uuid4().hex
         conv = self.seed(cid, persona_id=persona_id)
         conv.user_id = unified_msg_origin
         conv.title = title or "新会话"
+        self.session_conversations[unified_msg_origin] = cid  # 宿主 new_conversation 自动设当前
         return cid
+
+    async def get_curr_conversation_id(self, unified_msg_origin):
+        return self.session_conversations.get(unified_msg_origin)
 
     async def get_conversations(self, unified_msg_origin=None, platform_id=None):
         return [
@@ -211,6 +180,7 @@ class FakeConversationManager:
         ]
 
     async def get_conversation(self, unified_msg_origin, conversation_id, create_if_not_exists=False):
+        self.get_calls.append((unified_msg_origin, conversation_id))
         return self.convs.get(conversation_id)
 
     async def delete_conversation(self, unified_msg_origin, conversation_id=None):
@@ -218,7 +188,17 @@ class FakeConversationManager:
             self.convs.pop(conversation_id, None)
             self.deleted.append(conversation_id)
 
+    async def delete_conversations_by_user_id(self, unified_msg_origin):
+        for cid in [
+            conv.cid for conv in self.convs.values() if conv.user_id == unified_msg_origin
+        ]:
+            self.convs.pop(cid, None)
+            self.deleted.append(cid)
+        self.deleted_by_user.append(unified_msg_origin)
+        self.session_conversations.pop(unified_msg_origin, None)
+
     async def update_conversation(self, unified_msg_origin, conversation_id=None, history=None, title=None, persona_id=None, token_usage=None):
+        self.update_calls.append((unified_msg_origin, conversation_id, title))
         conv = self.convs.get(conversation_id)
         if conv is None:
             return
@@ -237,6 +217,105 @@ class FakeConversationManager:
         history.append(assistant_message)
         conv.history = json.dumps(history)
         self.pairs.append((cid, user_message, assistant_message))
+
+
+class FakeDb:
+    """stub：宿主 BaseDatabase（platform_sessions / attachments 最小面）。"""
+
+    def __init__(self) -> None:
+        self.platform_sessions: dict[str, SimpleNamespace] = {}
+        self.attachments: dict[str, SimpleNamespace] = {}
+        self._attachment_seq = 0
+        self.deleted_sessions: list[str] = []
+        self.deleted_attachments: list[str] = []
+
+    async def create_platform_session(self, creator, platform_id="webchat", session_id=None, display_name=None, is_group=0):
+        session = SimpleNamespace(
+            session_id=session_id or uuid.uuid4().hex,
+            creator=creator,
+            platform_id=platform_id,
+            display_name=display_name,
+            is_group=is_group,
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+        )
+        self.platform_sessions[session.session_id] = session
+        return session
+
+    async def get_platform_session_by_id(self, session_id):
+        return self.platform_sessions.get(session_id)
+
+    async def get_platform_sessions_by_creator(self, creator, platform_id=None, page=1, page_size=20):
+        sessions = [
+            s for s in self.platform_sessions.values()
+            if s.creator == creator and (platform_id is None or s.platform_id == platform_id)
+        ]
+        sessions.sort(key=lambda s: str(s.updated_at), reverse=True)
+        return [{"session": s, "project_id": None, "project_title": None, "project_emoji": None} for s in sessions]
+
+    async def delete_platform_session(self, session_id):
+        self.platform_sessions.pop(session_id, None)
+        self.deleted_sessions.append(session_id)
+
+    async def insert_attachment(self, path, type, mime_type):
+        self._attachment_seq += 1
+        attachment = SimpleNamespace(
+            attachment_id=f"att_{self._attachment_seq:06d}",
+            path=str(path),
+            type=type,
+            mime_type=mime_type,
+        )
+        self.attachments[attachment.attachment_id] = attachment
+        return attachment
+
+    async def get_attachment_by_id(self, attachment_id):
+        return self.attachments.get(attachment_id)
+
+    async def delete_attachment(self, attachment_id):
+        existed = self.attachments.pop(attachment_id, None) is not None
+        if existed:
+            self.deleted_attachments.append(attachment_id)
+        return existed
+
+
+class FakeHistoryManager:
+    """stub：PlatformMessageHistoryManager（内存行，page 1 最新语义与宿主一致）。"""
+
+    def __init__(self) -> None:
+        self.rows: list[SimpleNamespace] = []
+        self._seq = 0
+        self.inserts: list[dict] = []
+        self.deleted_offsets: list[dict] = []
+
+    async def insert(self, platform_id, user_id, content, sender_id=None, sender_name=None, llm_checkpoint_id=None, max_messages=None):
+        self._seq += 1
+        row = SimpleNamespace(
+            id=self._seq,
+            platform_id=platform_id,
+            user_id=user_id,
+            content=content,
+            sender_id=sender_id,
+            sender_name=sender_name,
+            llm_checkpoint_id=llm_checkpoint_id,
+            created_at=datetime.now(timezone.utc),
+        )
+        self.rows.append(row)
+        self.inserts.append({"content": content, "sender_id": sender_id, "checkpoint": llm_checkpoint_id})
+        return row
+
+    async def get(self, platform_id, user_id, page=1, page_size=200):
+        matched = [r for r in self.rows if r.platform_id == platform_id and r.user_id == user_id]
+        matched.sort(key=lambda r: r.id, reverse=True)  # 宿主 db desc(id)
+        offset = (page - 1) * page_size
+        page_rows = matched[offset:offset + page_size]
+        return list(reversed(page_rows))  # 宿主 manager.get 反转为页内旧->新
+
+    async def count(self, platform_id, user_id):
+        return len([r for r in self.rows if r.platform_id == platform_id and r.user_id == user_id])
+
+    async def delete(self, platform_id, user_id, offset_sec=86400):
+        self.deleted_offsets.append({"platform_id": platform_id, "user_id": user_id, "offset_sec": offset_sec})
+        self.rows = [r for r in self.rows if not (r.platform_id == platform_id and r.user_id == user_id)]
 
 
 class FakePersonaManager:
@@ -277,81 +356,25 @@ class FakePersonaManager:
         }
 
 
-class FakeTool:
-    """stub：FunctionTool 兼容工具对象（references/04 的 call(context, **kwargs) 接口）。"""
-
-    def __init__(self, name: str, result: str = "ok", error: str | None = None) -> None:
-        self.name = name
-        self.result = result
-        self.error = error
-        self.calls: list[dict] = []
-
-    async def call(self, context, **kwargs):  # noqa: ANN001
-        self.calls.append(kwargs)
-        if self.error:
-            raise RuntimeError(self.error)
-        return self.result
-
-
-class FakeToolManager:
-    """stub：宿主 LLM 工具管理器（func_list 成员，references/04 实证）。"""
-
-    def __init__(self, tools: list) -> None:
-        self.func_list = list(tools)
-
-
 class FakeContext:
-    """stub：宿主上下文（捕获 register_web_api 路由表 + 工具管理器/方案 B 入口）。"""
+    """stub：宿主上下文（捕获 register_web_api 路由表 + db/历史/会话管理器）。"""
 
     def __init__(self) -> None:
         self.routes: list[tuple[str, object, list[str], str]] = []
         self.conversation_manager = FakeConversationManager()
+        self.message_history_manager = FakeHistoryManager()
         self.persona_manager = FakePersonaManager([], "default")
-        self.provider = None
-        self.tool_manager: FakeToolManager | None = None
-        self.agent_calls: list[dict] = []
         self._stars = {"astrbot_plugin_webui": SimpleNamespace(version="v9.9.9-test")}
+        self.db = FakeDb()
+
+    def get_db(self) -> FakeDb:
+        return self.db
 
     def register_web_api(self, route, view_handler, methods, desc) -> None:
         self.routes.append((route, view_handler, list(methods), desc))
 
-    def get_using_provider(self, umo=None):
-        return self.provider
-
     def get_registered_star(self, name):
         return self._stars.get(name)
-
-    def get_llm_tool_manager(self):
-        if self.tool_manager is None:
-            raise AttributeError("tool manager 未配置")
-        return self.tool_manager
-
-    async def get_current_chat_provider_id(self, umo=None):
-        return "prov-1"
-
-    async def tool_loop_agent(self, event=None, chat_provider_id=None, prompt=None, system_prompt=None, contexts=None, tools=None, image_urls=None, agent_hooks=None):
-        """stub：方案 B 入口（触发钩子并返回最终响应）。"""
-        self.agent_calls.append(
-            {
-                "event": event,
-                "chat_provider_id": chat_provider_id,
-                "prompt": prompt,
-                "tools": tools,
-                "image_urls": image_urls,
-                "agent_hooks": agent_hooks,
-            }
-        )
-        if agent_hooks is not None:
-            await agent_hooks["on_using_llm_tool"](None, None, "get_weather", {"location": "北京"})
-            await agent_hooks["on_llm_tool_respond"](None, None, "get_weather", {"location": "北京"}, "晴 26℃")
-        return SimpleNamespace(
-            is_chunk=False,
-            result_chain=FakeChain("宿主循环答案"),
-            completion_text="宿主循环答案",
-            reasoning_content=None,
-            reasoning_signature=None,
-            usage={"output": 4, "total": 6},
-        )
 
 
 class FakePlugin:
@@ -378,11 +401,10 @@ def _schema_defaults() -> dict:
     return {key: item.get("default") for key, item in schema.items()}
 
 
-def make_plugin(sandbox: Path, provider: FakeProvider | None, config: dict | None = None) -> FakePlugin:
+def make_plugin(sandbox: Path, config: dict | None = None) -> FakePlugin:
     base = _schema_defaults()  # 代码不再有第二重默认值兜底，测试配置必须含全部键
     base.update(config or {})
     plugin = FakePlugin(sandbox, base)
-    plugin.context.provider = provider
     plugin.context.persona_manager = FakePersonaManager(
         [
             SimpleNamespace(persona_id="p1", system_prompt="你是测试人格", begin_dialogs=[], tools=None),
@@ -404,12 +426,35 @@ async def wait_for(cond, timeout: float = 2.0, interval: float = 0.01) -> bool:
     return cond()
 
 
-async def await_task(task: asyncio.Task) -> None:
-    """等待任务收尾并吸收 CancelledError（被中止任务的正常归宿）。"""
-    try:
-        await task
-    except asyncio.CancelledError:
-        pass
+def _stub_queue_mgr():
+    """桩 webchat_queue_mgr 单例（tests/stub 桩模块；脚本化载荷驱动排水翻译）。"""
+    from astrbot.core.platform.sources.webchat.webchat_queue_mgr import webchat_queue_mgr
+
+    return webchat_queue_mgr
+
+
+def _stub_registry():
+    """桩 active_event_registry 单例（记录 request_agent_stop_all 调用）。"""
+    from astrbot.core.utils.active_event_registry import active_event_registry
+
+    return active_event_registry
+
+
+def set_stub_host_data(sandbox: Path) -> Path:
+    """把桩宿主数据目录指到沙盒内（附件落点 = <sandbox>/hostdata/attachments/）。"""
+    from astrbot.core.utils import astrbot_path as stub_astrbot_path
+
+    hostdata = sandbox / "hostdata"
+    stub_astrbot_path.set_stub_data_path(hostdata)
+    return hostdata
+
+
+async def feed_frames(gen_id: str, frames: list[dict], interval: float = 0.01) -> None:
+    """把脚本化载荷按序投进桩 back_queue（模拟宿主管道输出；间隔避免空闲超时误触发）。"""
+    mgr = _stub_queue_mgr()
+    for frame in frames:
+        await asyncio.sleep(interval)
+        await mgr.put_back_queue(gen_id, frame)
 
 
 # ---------------------------------------------------------------------------
@@ -451,232 +496,357 @@ def test_sse() -> None:
 
 
 # ---------------------------------------------------------------------------
-# B. uistore.py：每 cid JSON / 原子写 / 版本字段 / 分页
+# B. uistore.py：v0.2 降级只读归档层（读/分页/list_archives/清档）
 # ---------------------------------------------------------------------------
 
 
+def _write_archive(sandbox: Path, cid: str, messages: list[dict], updated_at: str | None = None) -> Path:
+    """直接落一份归档文档（uistore 已无写 API，fixture 自备）。"""
+    root = sandbox / "ui_history"
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / f"{cid}.json"
+    doc = {
+        "version": uistore.SCHEMA_VERSION,
+        "cid": cid,
+        "updated_at": updated_at or uistore.now_iso(),
+        "messages": messages,
+    }
+    path.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
+    return path
+
+
 async def _test_uistore() -> None:
-    print("== B. uistore 每 cid 文件与分页 ==")
+    print("== B. uistore 只读归档层 ==")
     sandbox = fresh_sandbox()
     cid = uuid.uuid4().hex
 
-    m1 = await uistore.append_message(sandbox, cid, {"role": "user", "text": "你好"})
-    m2 = await uistore.append_message(
-        sandbox, cid, {"role": "assistant", "text": "回复", "usage": {"output": 3, "total": 9}}
+    path = _write_archive(
+        sandbox, cid,
+        [
+            {"id": "m_a", "role": "user", "text": "你好"},
+            {"id": "m_b", "role": "assistant", "text": "回复", "usage": {"output": 3, "total": 9}},
+            {"id": "m_c", "role": "user", "text": "msg1"},
+            {"id": "m_d", "role": "user", "text": "msg2"},
+        ],
     )
-    path = sandbox / "ui_history" / f"{cid}.json"
     check("B1 每 cid 一文件", path.is_file(), str(path))
-    check("B2 消息 id/ts 自动补全", m1["id"].startswith("m_") and "T" in m1["ts"])
-    check("B3 无临时文件残留", not list(path.parent.glob("*.tmp")))
-    doc = json.loads(path.read_text(encoding="utf-8"))
-    check("B4 版本字段", doc.get("version") == uistore.SCHEMA_VERSION == 1)
-    check("B5 messages 落盘 2 条", len(doc["messages"]) == 2)
 
     loaded = await uistore.load_conversation(sandbox, cid)
-    check("B6 load 一致", [m["id"] for m in loaded["messages"]] == [m1["id"], m2["id"]])
-    check("B7 has_user_message", await uistore.has_user_message(sandbox, cid) is True)
-    check(
-        "B8 空会话 has_user_message=False",
-        await uistore.has_user_message(sandbox, uuid.uuid4().hex) is False,
-    )
+    check("B2 load 一致", [m["id"] for m in loaded["messages"]] == ["m_a", "m_b", "m_c", "m_d"])
 
-    for i in range(3):
-        await uistore.append_message(sandbox, cid, {"role": "user", "text": f"msg{i}"})
     page1 = await uistore.page_messages(sandbox, cid, page=1, size=2)
-    check("B9 page=1 为最新一页", [m["text"] for m in page1["messages"]] == ["msg1", "msg2"], str([m["text"] for m in page1["messages"]]))
-    check("B10 total/size/page", (page1["total"], page1["size"], page1["page"]) == (5, 2, 1))
-    check("B11 has_more=True", page1["has_more"] is True)
-    check("B12 历史响应契约键", set(page1.keys()) == {"cid", "page", "size", "total", "has_more", "messages"})
-    page3 = await uistore.page_messages(sandbox, cid, page=3, size=2)
-    check("B13 最后一页含最早消息", [m["text"] for m in page3["messages"]] == ["你好"] and page3["has_more"] is False)
+    check("B3 page=1 为最新一页", [m["text"] for m in page1["messages"]] == ["msg1", "msg2"], str([m["text"] for m in page1["messages"]]))
+    check("B4 total/size/page", (page1["total"], page1["size"], page1["page"]) == (4, 2, 1))
+    check("B5 has_more=True", page1["has_more"] is True)
+    check("B6 历史响应契约键", set(page1.keys()) == {"cid", "page", "size", "total", "has_more", "messages"})
+    page3 = await uistore.page_messages(sandbox, cid, page=2, size=2)
+    check("B7 最后一页含最早消息", [m["text"] for m in page3["messages"]] == ["你好", "回复"] and page3["has_more"] is False)
     page9 = await uistore.page_messages(sandbox, cid, page=9, size=2)
-    check("B14 超页为空", page9["messages"] == [])
+    check("B8 超页为空", page9["messages"] == [])
 
     # 迁移预留：未知版本尽力读取
     other = uuid.uuid4().hex
     legacy = sandbox / "ui_history" / f"{other}.json"
     legacy.write_text(json.dumps({"version": 0, "cid": other, "messages": [{"role": "user", "text": "hi"}]}, ensure_ascii=False), encoding="utf-8")
     migrated = await uistore.load_conversation(sandbox, other)
-    check("B15 未知版本尽力读取", len(migrated["messages"]) == 1 and migrated["messages"][0]["text"] == "hi")
+    check("B9 未知版本尽力读取", len(migrated["messages"]) == 1 and migrated["messages"][0]["text"] == "hi")
 
     # 损坏兜底：不清空用户数据
     broken = sandbox / "ui_history" / f"{uuid.uuid4().hex}.json"
     broken.write_text("not-json{{{", encoding="utf-8")
     doc_broken = await uistore.load_conversation(sandbox, broken.stem)
-    check("B16 损坏兜底为空结构", doc_broken["messages"] == [])
-    check("B17 损坏文件保留", broken.is_file() and broken.read_text(encoding="utf-8") == "not-json{{{")
-    check("B18 缺失会话页为空", (await uistore.page_messages(sandbox, uuid.uuid4().hex))["total"] == 0)
+    check("B10 损坏兜底为空结构", doc_broken["messages"] == [])
+    check("B11 损坏文件保留", broken.is_file() and broken.read_text(encoding="utf-8") == "not-json{{{")
+    check("B12 缺失会话页为空", (await uistore.page_messages(sandbox, uuid.uuid4().hex))["total"] == 0)
 
     all_docs = await uistore.load_ui_history(sandbox)
-    check("B19 全量扫描（损坏文件跳过）", set(all_docs["conversations"].keys()) >= {cid, other}, str(set(all_docs["conversations"].keys())))
+    check("B13 全量扫描（损坏文件跳过）", set(all_docs["conversations"].keys()) >= {cid, other}, str(set(all_docs["conversations"].keys())))
+
+    archives = await uistore.list_archives(sandbox)
+    by_cid = {item["cid"]: item for item in archives}
+    check(
+        "B14 list_archives 归档项",
+        set(by_cid.keys()) >= {cid, other}
+        and by_cid[cid]["first_user_text"] == "你好"
+        and by_cid[other]["first_user_text"] == "hi",
+        str(archives),
+    )
 
     await uistore.clear_conversation(sandbox, cid)
-    check("B20 clear 删除文件", not path.exists())
+    check("B15 clear 删除归档文件", not path.exists())
 
 
 # ---------------------------------------------------------------------------
-# C. conversation_service.py：umo / CRUD / 改题 / contexts
+# C. conversation_service.py：umo / 双主键 / CRUD 映射宿主 / 历史读取
 # ---------------------------------------------------------------------------
 
 
 async def _test_conversation_service() -> None:
-    print("== C. conversation_service umo 与会话 CRUD ==")
-    check("C1 build_umo 形状", conversation_service.build_umo("abc") == "webui:FriendMessage:webui!abc")
+    print("== C. conversation_service umo 与双主键 CRUD ==")
+    check("C1 build_umo 形状", conversation_service.build_umo("abc") == "webchat:FriendMessage:webchat!astrbot_plugin_webui!abc")
     cid = uuid.uuid4().hex
     umo = conversation_service.build_umo(cid)
-    check("C2 parse_umo 往返", conversation_service.parse_umo(umo) == cid)
-    check("C3 外平台拒绝", conversation_service.parse_umo("aiocqhttp:GroupMessage:12345") is None)
-    check("C4 非 FriendMessage 拒绝", conversation_service.parse_umo("webui:GroupMessage:webui!x") is None)
-    check("C5 非 webui! 前缀拒绝", conversation_service.parse_umo("webui:FriendMessage:other!x") is None)
-    check("C6 残缺 umo 拒绝", conversation_service.parse_umo("webui") is None and conversation_service.parse_umo("") is None)
+    check("C2 parse_umo 往返", pipeline_bridge.parse_umo(umo) == cid)
+    check("C3 外平台拒绝", pipeline_bridge.parse_umo("aiocqhttp:GroupMessage:12345") is None)
+    check("C4 非 FriendMessage 拒绝", pipeline_bridge.parse_umo("webchat:GroupMessage:webchat!astrbot_plugin_webui!x") is None)
+    check("C5 非插件 creator 前缀拒绝", pipeline_bridge.parse_umo("webchat:FriendMessage:webchat!otheruser!x") is None)
+    check("C6 残缺 umo 拒绝", pipeline_bridge.parse_umo("webchat") is None and pipeline_bridge.parse_umo("") is None)
 
     sandbox = fresh_sandbox()
-    plugin = make_plugin(sandbox, provider=None)
-    cm = plugin.context.conversation_manager
+    plugin = make_plugin(sandbox)
+    context = plugin.context
+    cm = context.conversation_manager
+    db = context.db
 
-    info = await conversation_service.create_conversation(plugin.context, "p1", None)
+    info = await conversation_service.create_conversation(context, "p1", None)
     check("C7 新建返回 uuid4hex cid", len(info["cid"]) == 32 and all(ch in "0123456789abcdef" for ch in info["cid"]))
-    check("C8 缺省标题 新会话", info["title"] == "新会话" and cm.convs[info["cid"]].title == "新会话")
-    check("C9 平台命名空间落库", cm.convs[info["cid"]].platform_id == "webui")
-    check("C10 persona 绑定", cm.convs[info["cid"]].persona_id == "p1")
+    check("C8 缺省标题 新会话", info["title"] == "新会话" and cm.session_conversations[umo_of(info["cid"])].endswith(info["conversation_id"]))
+    check("C9 platform_session 落库（creator=插件名/platform=webchat）", info["cid"] in db.platform_sessions and db.platform_sessions[info["cid"]].creator == "astrbot_plugin_webui" and db.platform_sessions[info["cid"]].platform_id == "webchat")
+    check("C10 persona 绑定", cm.convs[info["conversation_id"]].persona_id == "p1")
+    check("C11 双主键（cid != conversation_id）", info["cid"] != info["conversation_id"])
+    check("C12 new_conversation 自动设当前会话", cm.session_conversations.get(umo_of(info["cid"])) == info["conversation_id"])
+    check("C12b new_conversation 的 umo 与注入 umo 逐字符一致", cm.new_calls == [pipeline_bridge.build_umo(info["cid"])], str(cm.new_calls))
 
-    c_old = cm.seed("oldc", updated_at=100)
-    c_new = cm.seed("newc", updated_at=200)
-    cm.seed("foreign")  # user_id 属本插件命名空间
-    cm.convs["foreign"].user_id = "aiocqhttp:GroupMessage:123"
-    items = await conversation_service.list_conversations(plugin.context)
+    # 改题：conv_id 必须经 get_curr_conversation_id 解析（禁传 cid）
+    await conversation_service.rename_conversation(context, info["cid"], "这是一条超过二十个字的长标题应该被截断到二十字整")
+    conv = await conversation_service.get_conversation(context, info["cid"])
+    check("C13 改题截 20 字（conv_id 解析路径）", conv is not None and conv.title == "这是一条超过二十个字的长标题应该被截断到二十字整"[:20])
+    check("C13b get_conversation 用 conv_id（非 cid）", bool(cm.get_calls) and cm.get_calls[-1][0] == pipeline_bridge.build_umo(info["cid"]) and cm.get_calls[-1][1] == info["conversation_id"] and cm.get_calls[-1][1] != info["cid"], str(cm.get_calls))
+    check("C13c update_conversation 的 umo 与 new 一致", bool(cm.update_calls) and cm.update_calls[0][0] == cm.new_calls[0] and cm.update_calls[0][1] == info["conversation_id"], str(cm.update_calls))
+    check("C14 update_conversation_title 未复活", "update_conversation_title(" not in inspect.getsource(conversation_service))
+
+    # 列表：platform_sessions + updated_at 降序
+    older = await conversation_service.create_conversation(context, None, None)
+    db.platform_sessions[older["cid"]].updated_at = datetime.now(timezone.utc) - timedelta(hours=1)
+    items = await conversation_service.list_conversations(context, sandbox)
     cids = [item["cid"] for item in items]
-    check("C11 updated_at 降序", cids.index("newc") < cids.index("oldc") if {"newc", "oldc"} <= set(cids) else False, str(cids))
-    check("C12 外来会话被过滤", "foreign" not in cids)
+    check("C15 updated_at 降序", cids.index(info["cid"]) < cids.index(older["cid"]), str(cids))
     shape = items[0]
-    check("C13 列表项契约键", set(shape.keys()) == {"cid", "title", "persona_id", "updated_at"})
-    check("C14 updated_at ISO 带时区", "T" in shape["updated_at"] and ("+" in shape["updated_at"] or "Z" in shape["updated_at"]))
+    check("C16 列表项契约键", set(shape.keys()) == {"cid", "title", "persona_id", "updated_at"}, str(shape.keys()))
+    check("C17 updated_at ISO 带时区", "T" in shape["updated_at"])
 
-    await conversation_service.rename_conversation(plugin.context, c_new.cid, "这是一条超过二十个字的长标题应该被截断到二十字整")
-    check("C15 update_conversation 改题截 20 字", cm.title_updates[-1] == (c_new.cid, "这是一条超过二十个字的长标题应该被截断到二十字整"[:20]))
-    source = inspect.getsource(conversation_service)
-    check("C16 未调用已废弃 update_conversation_title", "update_conversation_title(" not in source)
+    # 历史读取：平台历史映射（user + bot 含 reasoning/tools/usage/attachments）
+    cid1 = info["cid"]
+    hm = context.message_history_manager
+    await hm.insert(
+        platform_id="webchat", user_id=cid1,
+        content={"type": "user", "message": [
+            {"type": "plain", "text": "看看图"},
+            {"type": "image", "attachment_id": "att_000001", "filename": "a.png"},
+        ]},
+        sender_id="astrbot_plugin_webui", sender_name="astrbot_plugin_webui", llm_checkpoint_id="cp1",
+    )
+    # 先造索引（附件反查依赖）
+    disk = sandbox / "fake-att.png"
+    disk.write_bytes(b"png")
+    async with attachment_service._INDEX_LOCK:
+        index = await attachment_service._load_index(sandbox)
+        index["files"]["f_img1"] = {
+            "file_id": "f_img1", "attachment_id": "att_000001", "kind": "image", "name": "a.png",
+            "size": 3, "mime": "image/png", "preview": None, "path": disk.resolve().as_posix(),
+            "cid": cid1, "created_at": uistore.now_iso(),
+        }
+        await attachment_service._save_index(sandbox, index)
+    await hm.insert(
+        platform_id="webchat", user_id=cid1,
+        content={
+            "type": "bot",
+            "message": [
+                {"type": "plain", "text": "这是一张图"},
+                {"type": "tool_call", "tool_calls": [{"id": "call_1", "name": "get_weather", "args": {"city": "北京"}, "result": "晴", "finished_ts": 1.0}]},
+                {"type": "think", "think": "想了想"},
+            ],
+            "reasoning": "想了想",
+            "agent_stats": {"token_usage": {"input_other": 3, "input_cached": 2, "output": 5}},
+        },
+        sender_id="bot", sender_name="bot", llm_checkpoint_id="cp1",
+    )
+    result = await conversation_service.page_history(context, sandbox, cid1, 1, 30)
+    check("C18 平台历史分页契约键", set(result.keys()) == {"cid", "page", "size", "total", "has_more", "messages"}, str(result.keys()))
+    check("C19 历史两条（user+bot）", [m["role"] for m in result["messages"]] == ["user", "assistant"], str(result["messages"]))
+    bot_msg = result["messages"][1]
+    check("C20 bot 文本/reasoning/usage", bot_msg["text"] == "这是一张图" and bot_msg["reasoning"] == {"content": "想了想"} and bot_msg["usage"] == {"output": 5, "total": 10}, str(bot_msg))
+    check("C21 bot tools 映射", bot_msg["tools"][0]["name"] == "get_weather" and bot_msg["tools"][0]["result"] == "晴", str(bot_msg.get("tools")))
+    user_msg = result["messages"][0]
+    check("C22 user 附件索引反查", [a["file_id"] for a in user_msg.get("attachments") or []] == ["f_img1"], str(user_msg.get("attachments")))
+    check("C23 消息 id 平台行号同源", bot_msg["id"].startswith("m_") and user_msg["id"].startswith("m_"))
 
-    await conversation_service.append_history_pair(plugin.context, c_new.cid, "用户说", "模型答")
-    history = json.loads(cm.convs[c_new.cid].history)
-    check("C17 权威历史双写", history == [{"role": "user", "content": "用户说"}, {"role": "assistant", "content": "模型答"}])
-    check("C18 add_message_pair 调用记录", cm.pairs[-1][0] == c_new.cid)
+    # 分页语义：page 1 最新、页内旧->新、has_more 配 count（补 3 行凑 5 行）
+    for i in range(3):
+        await hm.insert(
+            platform_id="webchat", user_id=cid1,
+            content={"type": "user", "message": [{"type": "plain", "text": f"u{i + 3}"}]},
+            sender_id="astrbot_plugin_webui", sender_name="astrbot_plugin_webui", llm_checkpoint_id="cp1",
+        )
+    p1 = await conversation_service.page_history(context, sandbox, cid1, 1, 2)
+    check("C-P1 page=1 最新两条（页内旧->新）", [m["text"] for m in p1["messages"]] == ["u4", "u5"], str([m["text"] for m in p1["messages"]]))
+    check("C-P2 has_more 用 count", p1["total"] == 5 and p1["has_more"] is True)
+    p2 = await conversation_service.page_history(context, sandbox, cid1, 2, 2)
+    check("C-P3 page=2 中段（bot 在前）", [m["text"] for m in p2["messages"]] == ["这是一张图", "u3"], str([m["text"] for m in p2["messages"]]))
+    p3 = await conversation_service.page_history(context, sandbox, cid1, 3, 2)
+    check("C-P4 末页最早一条 + has_more=False", [m["text"] for m in p3["messages"]] == ["看看图"] and p3["has_more"] is False)
 
-    think_entry = {"role": "assistant", "content": [{"type": "think", "signature": "sig", "text": "思考"}]}
-    history.append(think_entry)
-    cm.convs[c_new.cid].history = json.dumps(history)
-    contexts = await conversation_service.build_contexts(plugin.context, c_new.cid)
-    check("C19 contexts 原样保留 ThinkPart/signature", contexts[-1] == think_entry)
-
+    # legacy 分支：无 platform_session + 有归档 -> legacy:true
+    legacy_cid = uuid.uuid4().hex
+    _write_archive(sandbox, legacy_cid, [{"id": "m_l", "role": "user", "text": "旧消息"}])
+    legacy_result = await conversation_service.page_history(context, sandbox, legacy_cid, 1, 30)
+    check("C24 legacy 响应附 legacy:true", legacy_result.get("legacy") is True and legacy_result["messages"][0].get("legacy") is True, str(legacy_result))
     try:
-        await conversation_service.build_contexts(plugin.context, "missing-cid")
-        check("C20 会话不存在抛错", False)
+        await conversation_service.page_history(context, sandbox, uuid.uuid4().hex, 1, 30)
+        check("C25 无宿主无归档 404", False)
     except conversation_service.ConversationNotFoundError:
-        check("C20 会话不存在抛错", True)
+        check("C25 无宿主无归档 404", True)
 
-    await conversation_service.delete_conversation(plugin.context, c_new.cid, sandbox)
-    check("C21 级联删权威会话", c_new.cid in cm.deleted)
-    check("C22 幂等删除", (await conversation_service.delete_conversation(plugin.context, c_new.cid, sandbox)) is None)
+    # 删除：宿主级联（platform_session 存在）
+    cid2 = older["cid"]
+    await conversation_service.delete_conversation(context, cid2, sandbox)
+    check("C26 级联 delete_conversations_by_user_id", umo_of(cid2) in cm.deleted_by_user)
+    check("C27 级联 delete_platform_session", cid2 in db.deleted_sessions)
+    check("C28 级联平台历史删（offset_sec=99999999）", any(d["offset_sec"] == 99999999 and d["user_id"] == cid2 for d in hm.deleted_offsets), str(hm.deleted_offsets))
+
+    # 删除：legacy 分支（无 platform_session）只删归档文件，不触宿主
+    host_deletes_before = len(cm.deleted_by_user)
+    await conversation_service.delete_conversation(context, legacy_cid, sandbox)
+    check("C29 legacy 删归档文件", not (sandbox / "ui_history" / f"{legacy_cid}.json").exists())
+    check("C30 legacy 不触宿主", len(cm.deleted_by_user) == host_deletes_before and legacy_cid not in db.deleted_sessions)
+
+
+def umo_of(cid: str) -> str:
+    """测试辅助：cid -> 插件命名空间 umo。"""
+    return pipeline_bridge.build_umo(cid)
 
 
 # ---------------------------------------------------------------------------
-# D. chat_service.py：生成任务 / 事件序列 / 409 / abort / 双写
+# D. chat_service.py 生成内核（v0.2）：注入-排水 / 翻译表 / stop / 超时 / 队列纪律
+# （脚本化载荷序列驱动桩 back_queue；宿主管道行为以 webchat_event.py 实源为准）
 # ---------------------------------------------------------------------------
+
+
+def _std_frames(gen_id: str) -> list[dict]:
+    """标准脚本化载荷：翻译表逐型 + 坏载荷防御 + 冗余帧（D1/E36 复用）。
+
+    期望 SSE 事件序列：reasoning_delta / text_delta / tool_call / tool_result /
+    text_delta / done（坏 JSON tool_call、非 dict 载荷、message_id 不匹配、
+    run_started、complete 均不产事件）。
+    """
+    return [
+        {"type": "run_started", "data": {"run_id": gen_id}, "streaming": False, "message_id": gen_id},
+        {"type": "plain", "data": "思考中", "streaming": True, "chain_type": "reasoning", "message_id": gen_id},
+        {"type": "plain", "data": "今天", "streaming": True, "chain_type": None, "message_id": gen_id},
+        # 坏载荷防御：坏 JSON tool_call / 非 dict 载荷 / message_id 不匹配 —— 不炸流、不产无意义事件
+        {"type": "plain", "data": "{not-json", "streaming": True, "chain_type": "tool_call", "message_id": gen_id},
+        "garbage-payload",
+        {"type": "plain", "data": "忽略", "streaming": True, "chain_type": None, "message_id": "other-gen"},
+        {"type": "plain", "data": json.dumps({"id": "c1", "name": "get_weather", "args": {"city": "北京"}, "ts": 1.0}), "streaming": True, "chain_type": "tool_call", "message_id": gen_id},
+        {"type": "plain", "data": json.dumps({"id": "c1", "ts": 2.0, "result": "晴 26℃"}), "streaming": True, "chain_type": "tool_call_result", "message_id": gen_id},
+        {"type": "plain", "data": "晴", "streaming": True, "chain_type": None, "message_id": gen_id},
+        {"type": "plain", "data": json.dumps({"token_usage": {"input_other": 3, "input_cached": 2, "output": 5}, "current_context_tokens": 10}), "streaming": True, "chain_type": "agent_stats", "message_id": gen_id},
+        {"type": "complete", "data": "今天晴", "reasoning": "思考中", "streaming": True, "message_id": gen_id},  # 冗余帧：正文/思考已由流式 plain 覆盖
+        {"type": "end", "data": "", "streaming": False, "message_id": gen_id},
+    ]
 
 
 async def _test_chat_happy_path() -> None:
-    print("== D1. 正常流式生成与双写 ==")
+    print("== D1. 注入-排水全链：翻译表逐型 + bot 落库 + done + 队列纪律 ==")
     chat_service._GENERATIONS.clear()
+    _stub_registry().stop_requests.clear()
     sandbox = fresh_sandbox()
     text = "第一句话测试自动改题"
-    provider = FakeProvider(
-        [
-            [_chunk("你"), _chunk(reasoning="思考一下"), _chunk("好"), _final("你好", "思考一下", {"input": 10, "output": 5})],
-            [_chunk("再"), _final("再来", None, {"output": 2})],
-        ]
-    )
-    plugin = make_plugin(sandbox, provider)
-    info = await conversation_service.create_conversation(plugin.context, "p1", None)
+    plugin = make_plugin(sandbox)
+    info = await conversation_service.create_conversation(plugin.context, None, None)
     cid = info["cid"]
+    mgr = _stub_queue_mgr()
+    hm = plugin.context.message_history_manager
 
     gen_id = await chat_service.start_generation(plugin, cid, text)
-    check("D1 gen_id uuid4hex", len(gen_id) == 32)
-    check("D2 进行中可查", chat_service.active_generation_id(cid) == gen_id)
+    check("D1-1 gen_id uuid4hex", len(gen_id) == 32)
+    check("D1-2 进行中可查", chat_service.active_generation_id(cid) == gen_id)
+    # 生成任务是 create_task 调度的：等注入三步落地（平台历史 + back_queue）再断言
+    check("D1-3 注入落地（平台历史+back_queue）", await wait_for(lambda: gen_id in mgr.back_queues and bool(hm.rows), timeout=2))
+
+    # 注入三步形状（§0.2：先落平台历史 -> back_queue -> 会话队列 put）
+    check("D1-4 用户消息先落平台历史", hm.rows and hm.rows[0].content["type"] == "user")
+    check("D1-5 落库 parts 剥 path 且含 plain", hm.rows[0].content["message"] == [{"type": "plain", "text": text}])
+    check("D1-6 sender 自补 creator", hm.rows[0].sender_id == "astrbot_plugin_webui" and hm.rows[0].sender_name == "astrbot_plugin_webui")
+    item = await asyncio.wait_for(mgr.queues[cid].get(), timeout=2)
+    creator, qcid, payload = item
+    check("D1-7 队列 tuple (creator, cid, payload)", creator == "astrbot_plugin_webui" and qcid == cid)
+    check("D1-8 payload message_id=gen_id + 流式 flags", payload["message_id"] == gen_id and payload["flags"] == {"enable_streaming": True, "enable_reasoning": True})
+    check("D1-9 checkpoint 注入/落库同源", payload["llm_checkpoint_id"] == hm.inserts[0]["checkpoint"])
+
+    await feed_frames(gen_id, _std_frames(gen_id))
     entry = chat_service._GENERATIONS[gen_id]
-    await await_task(entry["task"])
+    await asyncio.wait_for(entry["task"], timeout=10)
 
-    events = await chat_service.replay_events(gen_id)
-    check("D3 事件序列 text/reasoning/text/done", [e["event"] for e in events] == ["text_delta", "reasoning_delta", "text_delta", "done"], str([e["event"] for e in events]))
-    check("D4 seq 从 0 递增", [e["data"]["seq"] for e in events] == [0, 1, 2, 3])
-    check("D5 delta 内容", (events[0]["data"]["delta"], events[2]["data"]["delta"]) == ("你", "好"))
-    done = events[3]["data"]
-    check("D6 done 形状", done["message_id"].startswith("m_") and done["usage"] == {"output": 5, "total": 15}, str(done))
-    check("D7 重放幂等（两次一致）", events == await chat_service.replay_events(gen_id))
-    check("D8 终态后 active=None", chat_service.active_generation_id(cid) is None)
-    check("D9 存活期内 generation_exists", chat_service.generation_exists(gen_id) is True)
-
-    doc = await uistore.load_conversation(sandbox, cid)
-    check("D10 双写-富历史两条", [m["role"] for m in doc["messages"]] == ["user", "assistant"])
-    user_msg, assistant_msg = doc["messages"]
-    check("D11 富历史文本一致", user_msg["text"] == text and assistant_msg["text"] == "你好")
-    check("D12 reasoning 入富历史", assistant_msg.get("reasoning") == {"content": "思考一下"})
-    check("D13 usage 入富历史", assistant_msg["usage"] == {"output": 5, "total": 15})
-    check("D14 message_id 对齐", assistant_msg["id"] == done["message_id"])
-    pair = plugin.context.conversation_manager.pairs[-1]
-    check("D15 双写-权威历史一致", pair[1] == {"role": "user", "content": text} and pair[2] == {"role": "assistant", "content": "你好"})
-    check("D16 首条消息自动改题", plugin.context.conversation_manager.title_updates == [(cid, text[:20])])
-
-    gen2 = await chat_service.start_generation(plugin, cid, "第二句不重复改题")
-    await await_task(chat_service._GENERATIONS[gen2]["task"])
-    check("D17 仅首条消息改题", len(plugin.context.conversation_manager.title_updates) == 1)
-    check("D18 provider 调用参数", provider.calls[0]["image_urls"] is None and provider.calls[0]["system_prompt"] == "你是测试人格")
-
-    unknown = uuid.uuid4().hex
-    try:
-        await chat_service.replay_events(unknown)
-        check("D19 未知 gen_id 404（重放）", False)
-    except chat_service.GenerationNotFoundError:
-        check("D19 未知 gen_id 404（重放）", True)
-    check("D20 未知 gen_id 404（stop 返回 False）", await chat_service.abort_generation(unknown) is False)
-    check("D21 generation_exists False", chat_service.generation_exists(unknown) is False)
-    check("D22 text_chat_stream 仅 chat_service 触碰", len(provider.calls) == 2)
+    events = [e["event"] for e in entry["buffer"]]
+    check("D1-10 翻译表逐型", events == ["reasoning_delta", "text_delta", "tool_call", "tool_result", "text_delta", "done"], str(events))
+    check("D1-11 seq 从 0 单调", [e["data"]["seq"] for e in entry["buffer"]] == list(range(6)))
+    check("D1-12 delta 内容", (entry["buffer"][0]["data"]["delta"], entry["buffer"][1]["data"]["delta"], entry["buffer"][4]["data"]["delta"]) == ("思考中", "今天", "晴"))
+    check("D1-13 坏载荷/不匹配/冗余帧不产事件", len(entry["buffer"]) == 6)
+    tool_call = entry["buffer"][2]["data"]
+    check("D1-14 tool_call 契约", tool_call == {"seq": tool_call["seq"], "phase": "start", "id": "c1", "name": "get_weather", "args": {"city": "北京"}}, str(tool_call))
+    tool_result = entry["buffer"][3]["data"]
+    check(
+        "D1-15 tool_result result|error 互斥 + elapsed_ms>=0",
+        tool_result.get("id") == "c1" and tool_result.get("result") == "晴 26℃"
+        and "error" not in tool_result and isinstance(tool_result.get("elapsed_ms"), int) and tool_result["elapsed_ms"] >= 0,
+        str(tool_result),
+    )
+    done = entry["buffer"][5]["data"]
+    bot_rows = [r for r in hm.rows if r.content.get("type") == "bot"]
+    check("D1-16 done.usage 来自 agent_stats", done["usage"] == {"output": 5, "total": 10}, str(done))
+    check("D1-17 done.message_id=平台行号同源", len(bot_rows) == 1 and done["message_id"] == f"m_{bot_rows[0].id}")
+    content = bot_rows[0].content
+    check("D1-18 bot content 形状（type/reasoning/agent_stats）", content["type"] == "bot" and content.get("reasoning") == "思考中" and content.get("agent_stats", {}).get("token_usage", {}).get("output") == 5, str(content)[:200])
+    part_types = [p["type"] for p in content["message"]]
+    # 宿主 BotMessageAccumulator 语义：工具段前 flush 正文缓冲，"晴" 另起 plain（对照 :244-267 实源）
+    check("D1-19 bot parts 形状 think/plain/tool_call/plain", part_types == ["think", "plain", "tool_call", "plain"], str(part_types))
+    plain_parts = [p for p in content["message"] if p["type"] == "plain"]
+    check("D1-20 bot 正文分缓冲累积", [p["text"] for p in plain_parts] == ["今天", "晴"], str(plain_parts))
+    tool_part = [p for p in content["message"] if p["type"] == "tool_call"][0]["tool_calls"][0]
+    check("D1-21 bot 工具段回填", tool_part["id"] == "c1" and tool_part["result"] == "晴 26℃", str(tool_part))
+    check("D1-22 bot sender=bot + checkpoint 同源", bot_rows[0].sender_id == "bot" and hm.inserts[1]["checkpoint"] == payload["llm_checkpoint_id"])
+    # 队列纪律 + 任务收尾
+    check("D1-23 正常路径队列已清理", gen_id not in mgr.back_queues and gen_id not in mgr._request_conversation)
+    check("D1-24 任务正常收尾（非取消）", entry["task"].done() and not entry["task"].cancelled())
+    check("D1-25 终态后 active=None", chat_service.active_generation_id(cid) is None)
+    check("D1-26 存活期内 generation_exists", chat_service.generation_exists(gen_id) is True)
+    check("D1-27 重放幂等", [e["event"] for e in entry["buffer"]] == [e["event"] for e in await chat_service.replay_events(gen_id)])
+    # 双主键：自动改题经 conv_id；new_conversation/update umo 逐字符一致
+    cm = plugin.context.conversation_manager
+    check("D1-28 自动改题经 conv_id（非 cid）", bool(cm.title_updates) and cm.title_updates[0][0] == info["conversation_id"] and cm.title_updates[0][0] != cid, str(cm.title_updates))
+    check("D1-29 new_conversation/update umo 逐字符一致", cm.update_calls and cm.update_calls[0][0] == cm.new_calls[0] == pipeline_bridge.build_umo(cid), str(cm.update_calls))
+    check("D1-30 改题截 20 字", cm.update_calls[0][2] == text[:20])
+    check("D1-31 未知 gen_id stop 404", await chat_service.abort_generation(uuid.uuid4().hex) is False)
 
 
 async def _test_chat_session_busy() -> None:
     print("== D2. 同会话 single-flight 409 ==")
     chat_service._GENERATIONS.clear()
     sandbox = fresh_sandbox()
-    provider = FakeProvider([[_chunk("慢"), asyncio.Event()]])
-    provider.gate = asyncio.Event()  # 永不置位：生成任务挂起在闸门（模拟进行中）
-    plugin = make_plugin(sandbox, provider)
-    info = await conversation_service.create_conversation(plugin.context, "p1", None)
-    cid = info["cid"]
+    plugin = make_plugin(sandbox)
+    cid = (await conversation_service.create_conversation(plugin.context, None, None))["cid"]
 
     gen_id = await chat_service.start_generation(plugin, cid, "第一条")
-    entry = chat_service._GENERATIONS[gen_id]
-    ok = await wait_for(lambda: any(e["event"] == "text_delta" for e in entry["buffer"]))
-    check("D2-1 首个事件已产出", ok)
-
+    check("D2-1 首任务占位（无帧保持进行中）", chat_service.active_generation_id(cid) == gen_id)
     try:
         await chat_service.start_generation(plugin, cid, "第二条")
         check("D2-2 同会话 409 session_busy", False)
     except chat_service.SessionBusyError as exc:
         check("D2-2 同会话 409 session_busy", exc.status_code == 409 and exc.slug == "session_busy")
+    check("D2-3 被拒者未落用户消息", await wait_for(lambda: len([r for r in plugin.context.message_history_manager.rows if r.content.get("type") == "user"]) == 1, timeout=2))
 
-    check("D2-3 abort 成功", await chat_service.abort_generation(gen_id) is True)
-    await asyncio.wait([entry["task"]])
-    check("D2-4 中止后可再发送（active=None）", chat_service.active_generation_id(cid) is None)
+    await feed_frames(gen_id, [{"type": "end", "data": "", "streaming": False, "message_id": gen_id}])
+    await asyncio.wait_for(chat_service._GENERATIONS[gen_id]["task"], timeout=5)
+    check("D2-4 收尾后 active=None", chat_service.active_generation_id(cid) is None)
+    check("D2-5 空回复不落 bot 行", not [r for r in plugin.context.message_history_manager.rows if r.content.get("type") == "bot"])
 
 
 async def _test_chat_concurrency() -> None:
     print("== D3. 全局并发上限实时读取配置 ==")
     chat_service._GENERATIONS.clear()
     sandbox = fresh_sandbox()
-    gate = asyncio.Event()
-    provider = FakeProvider([[_chunk("a"), gate], [_chunk("b"), gate], [_chunk("c"), gate]])
-    provider.gate = gate
-    plugin = make_plugin(sandbox, provider, config={"max_concurrent_generations": 1})
-    cm = plugin.context.conversation_manager
+    plugin = make_plugin(sandbox, config={"max_concurrent_generations": 1})
     c1 = (await conversation_service.create_conversation(plugin.context, None, None))["cid"]
     c2 = (await conversation_service.create_conversation(plugin.context, None, None))["cid"]
 
@@ -691,94 +861,270 @@ async def _test_chat_concurrency() -> None:
     g2 = await chat_service.start_generation(plugin, c2, "二")
     check("D3-2 配置实时读取后放行", chat_service.active_generation_id(c2) == g2)
 
-    gate.set()
-    await asyncio.gather(
-        await_task(chat_service._GENERATIONS[g1]["task"]),
-        await_task(chat_service._GENERATIONS[g2]["task"]),
+    await feed_frames(g1, [{"type": "end", "data": "", "streaming": False, "message_id": g1}])
+    await feed_frames(g2, [{"type": "end", "data": "", "streaming": False, "message_id": g2}])
+    await asyncio.wait_for(
+        asyncio.gather(chat_service._GENERATIONS[g1]["task"], chat_service._GENERATIONS[g2]["task"]),
+        timeout=5,
     )
+    check("D3-3 双任务收尾归零", chat_service._active_count() == 0)
 
 
 async def _test_chat_abort() -> None:
-    print("== D4. abort 先落 stopped 终态 + 重订阅 ==")
+    print("== D4. stop 先落终态 + 优雅中止 + 消费任务不被 cancel + 部分回复落历史 ==")
     chat_service._GENERATIONS.clear()
+    registry = _stub_registry()
+    registry.stop_requests.clear()
     sandbox = fresh_sandbox()
-    text = "测试中止的部分回复"
-    provider = FakeProvider([[_chunk("部分"), asyncio.Event()]])
-    provider.gate = asyncio.Event()  # 永不置位：生成任务挂起在闸门（模拟进行中）
-    plugin = make_plugin(sandbox, provider)
-    cid = (await conversation_service.create_conversation(plugin.context, "p1", None))["cid"]
+    plugin = make_plugin(sandbox)
+    cid = (await conversation_service.create_conversation(plugin.context, None, None))["cid"]
 
-    gen_id = await chat_service.start_generation(plugin, cid, text)
+    gen_id = await chat_service.start_generation(plugin, cid, "测试中止的部分回复")
     entry = chat_service._GENERATIONS[gen_id]
-    ok = await wait_for(lambda: any(e["event"] == "text_delta" for e in entry["buffer"]))
-    check("D4-1 首个增量已缓冲", ok)
+    await feed_frames(gen_id, [{"type": "plain", "data": "部分", "streaming": True, "chain_type": None, "message_id": gen_id}])
+    check("D4-1 首个增量已缓冲", await wait_for(lambda: any(e["event"] == "text_delta" for e in entry["buffer"])))
 
     check("D4-2 stop 返回 True", await chat_service.abort_generation(gen_id) is True)
-    await asyncio.wait([entry["task"]])
-    check("D4-3 任务已取消", entry["task"].cancelled() or entry["task"].done())
+    check("D4-3 stopped 终态已入缓冲", await wait_for(lambda: any(e["event"] == "stopped" for e in entry["buffer"])))
+    check("D4-4 事件序列 text_delta+stopped", [e["event"] for e in entry["buffer"]] == ["text_delta", "stopped"])
+    stopped = entry["buffer"][-1]["data"]
+    check("D4-5 stopped 文案契约", stopped["message"] == "已手动停止", str(stopped))
+    check("D4-6 registry.request_agent_stop_all(umo) 被调用", registry.stop_requests == [pipeline_bridge.build_umo(cid)], str(registry.stop_requests))
+    check("D4-7 消费任务未被 cancel（继续排水等 end）", not entry["task"].done())
+    check("D4-8 已终态再 stop -> False(404)", await chat_service.abort_generation(gen_id) is False)
 
-    events = await chat_service.replay_events(gen_id)
-    check("D4-4 终态为 stopped", events[-1]["event"] == "stopped", str([e["event"] for e in events]))
-    check("D4-5 stopped 文案契约", events[-1]["data"] == {"seq": events[-1]["data"]["seq"], "message": "已手动停止"}, str(events[-1]["data"]))
-    check("D4-6 stopped 在 text_delta 之后", [e["event"] for e in events] == ["text_delta", "stopped"])
+    received = [item async for item in chat_service.iter_events(gen_id)]
+    check("D4-9 重订阅全量重放且终态关流", [i["event"] for i in received] == ["text_delta", "stopped"])
 
-    check("D4-7 已结束再 stop -> False(404)", await chat_service.abort_generation(gen_id) is False)
-
-    # 重订阅：iter_events 全量重放，最后一条仍是终态 stopped（流会关）
-    received: list[dict] = []
-    async for item in chat_service.iter_events(gen_id):
-        received.append(item)
-    check("D4-8 重订阅重放一致", received == events)
-    check("D4-9 重订阅见 stopped 终态", received[-1]["event"] == "stopped")
-
-    doc = await uistore.load_conversation(sandbox, cid)
-    check("D4-10 中止保留部分回复", doc["messages"][-1].get("text") == "部分" and doc["messages"][-1].get("stopped") is True)
-    pair = plugin.context.conversation_manager.pairs[-1]
-    check("D4-11 权威历史写入部分回复", pair[2] == {"role": "assistant", "content": "部分"})
+    await feed_frames(gen_id, [{"type": "end", "data": "", "streaming": False, "message_id": gen_id}])
+    await asyncio.wait_for(entry["task"], timeout=5)
+    check("D4-10 排水到 end 自然收尾（非取消）", entry["task"].done() and not entry["task"].cancelled())
+    bot_rows = [r for r in plugin.context.message_history_manager.rows if r.content.get("type") == "bot"]
+    check(
+        "D4-11 部分回复照常落平台历史",
+        len(bot_rows) == 1 and pipeline_bridge.collect_plain_text_from_message_parts(bot_rows[0].content["message"]) == "部分",
+        str(bot_rows[0].content if bot_rows else None),
+    )
+    check("D4-12 队列已清理", gen_id not in _stub_queue_mgr().back_queues)
+    check("D4-13 终态后 active=None", chat_service.active_generation_id(cid) is None)
 
 
-async def _test_chat_provider_error() -> None:
-    print("== D5. provider 异常 -> error 终态 ==")
+async def _test_chat_idle_timeout() -> None:
+    print("== D5. 排水空闲超时兜底（注入短超时触发）==")
     chat_service._GENERATIONS.clear()
     sandbox = fresh_sandbox()
-
-    class _BoomProvider:
-        def __init__(self) -> None:
-            self.calls = 0
-
-        def text_chat_stream(self, **kwargs):
-            self.calls += 1
-            return self._gen()
-
-        async def _gen(self):
-            yield _chunk("开头")
-            raise RuntimeError("boom 上游炸了")
-
-    provider = _BoomProvider()
-    plugin = make_plugin(sandbox, provider)  # type: ignore[arg-type]
-    cid = (await conversation_service.create_conversation(plugin.context, "p1", None))["cid"]
-
-    gen_id = await chat_service.start_generation(plugin, cid, "触发异常")
-    await await_task(chat_service._GENERATIONS[gen_id]["task"])
-    events = await chat_service.replay_events(gen_id)
-    check("D5-1 事件序列 delta+error", [e["event"] for e in events] == ["text_delta", "error"], str([e["event"] for e in events]))
-    err = events[-1]["data"]
-    check("D5-2 error fatal 终态", err.get("fatal") is True and err.get("code") == "server_error" and "boom" in err.get("message", ""), str(err))
-    doc = await uistore.load_conversation(sandbox, cid)
-    check("D5-3 失败占位消息", doc["messages"][-1].get("error") is not None and doc["messages"][-1]["role"] == "assistant")
-    check("D5-4 失败不写权威历史", plugin.context.conversation_manager.pairs == [])
-
-
-async def _test_chat_no_provider() -> None:
-    print("== D6. 未配置 provider -> error 终态 ==")
-    chat_service._GENERATIONS.clear()
-    sandbox = fresh_sandbox()
-    plugin = make_plugin(sandbox, provider=None)
+    plugin = make_plugin(sandbox)
     cid = (await conversation_service.create_conversation(plugin.context, None, None))["cid"]
-    gen_id = await chat_service.start_generation(plugin, cid, "没有模型")
-    await await_task(chat_service._GENERATIONS[gen_id]["task"])
-    events = await chat_service.replay_events(gen_id)
-    check("D6-1 error 终态", events[-1]["event"] == "error" and events[-1]["data"]["fatal"] is True)
+    real_timeout = pipeline_bridge.IDLE_TIMEOUT_SECONDS
+    try:
+        pipeline_bridge.IDLE_TIMEOUT_SECONDS = 0.25  # consume_generation 调用时解析常量，可注入
+        gen_id = await chat_service.start_generation(plugin, cid, "永不回帧")
+        entry = chat_service._GENERATIONS[gen_id]
+        await asyncio.wait_for(entry["task"], timeout=10)
+        events = [e["event"] for e in entry["buffer"]]
+        check("D5-1 空闲超时写 error 终态", events == ["error"], str(events))
+        err = entry["buffer"][-1]["data"]
+        check("D5-2 error fatal+code+文案", err.get("fatal") is True and err.get("code") == "server_error" and "超时" in err.get("message", ""), str(err))
+        check("D5-3 超时路径队列已清理", gen_id not in _stub_queue_mgr().back_queues)
+        check("D5-4 终态后 active=None", chat_service.active_generation_id(cid) is None)
+    finally:
+        pipeline_bridge.IDLE_TIMEOUT_SECONDS = real_timeout
+
+
+async def _test_chat_queue_discipline() -> None:
+    print("== D6. remove_back_queue 纪律（异常/取消/shutdown 三路径）==")
+    chat_service._GENERATIONS.clear()
+    mgr = _stub_queue_mgr()
+    sandbox = fresh_sandbox()
+    plugin = make_plugin(sandbox)
+
+    # 异常路径：emit 抛错 -> 排水循环异常逃逸 -> finally 清队列（不依赖外层兜底）
+    gen_x = f"genx{uuid.uuid4().hex}"
+    bq = mgr.get_or_create_back_queue(gen_x, "cidx")
+    await bq.put({"type": "plain", "data": "x", "streaming": True, "chain_type": None, "message_id": gen_x})
+
+    def _boom(event, data):  # emit 契约是同步回调（chat_service._make_emit 同款）
+        raise RuntimeError("emit boom")
+
+    try:
+        await asyncio.wait_for(
+            pipeline_bridge.consume_generation(plugin.context, "cidx", gen_x, bq, "cp", _boom, idle_timeout=2.0),
+            timeout=5,
+        )
+        check("D6-1 emit 抛错异常逃逸", False)
+    except RuntimeError:
+        check("D6-1 emit 抛错异常逃逸", True)
+    check("D6-2 异常路径队列已清理", gen_x not in mgr.back_queues)
+
+    # 取消路径：cancel_generation_tasks（级联删除专用）先落 stopped 再 cancel
+    info = await conversation_service.create_conversation(plugin.context, None, None)
+    cid = info["cid"]
+    gen_id = await chat_service.start_generation(plugin, cid, "会被取消")
+    await chat_service.cancel_generation_tasks(cid, wait=True)
+    entry = chat_service._GENERATIONS[gen_id]
+    check("D6-3 取消路径任务已收尾（cancelled）", entry["task"].done() and entry["task"].cancelled())
+    check("D6-4 取消前落 stopped 终态", [e["event"] for e in entry["buffer"]] == ["stopped"])
+    check("D6-5 取消路径队列已清理", gen_id not in mgr.back_queues)
+
+    # shutdown 路径：terminate 全量落终态 + cancel + 清队列
+    gen2 = await chat_service.start_generation(plugin, cid, "shutdown 清理")
+    await chat_service.shutdown()
+    entry2 = chat_service._GENERATIONS[gen2]
+    check("D6-6 shutdown 落 stopped 终态", [e["event"] for e in entry2["buffer"]] == ["stopped"])
+    check("D6-7 shutdown 队列已清理", gen2 not in mgr.back_queues and gen_id not in mgr.back_queues)
+    check("D6-8 shutdown 任务已收尾", entry2["task"].done() and entry2["task"].cancelled())
+
+
+async def _test_chat_media_frames() -> None:
+    print("== D7. bot 媒体帧：db 注册 + 索引 + 助手 attachments；缺文件防御 ==")
+    chat_service._GENERATIONS.clear()
+    sandbox = fresh_sandbox()
+    hostdir = set_stub_host_data(sandbox) / "attachments"
+    hostdir.mkdir(parents=True, exist_ok=True)
+    plugin = make_plugin(sandbox)
+    cid = (await conversation_service.create_conversation(plugin.context, None, None))["cid"]
+    (hostdir / "bot_pic.png").write_bytes(b"pngdata")
+    (hostdir / "store.bin").write_bytes(b"bindata")
+    db_count_before = len(plugin.context.db.attachments)
+
+    gen_id = await chat_service.start_generation(plugin, cid, "发图给我")
+    frames = [
+        {"type": "image", "data": "[IMAGE]bot_pic.png", "streaming": True, "message_id": gen_id},
+        {"type": "file", "data": "[FILE]store.bin|原始名.bin", "streaming": True, "message_id": gen_id},
+        {"type": "image", "data": "[IMAGE]missing.png", "streaming": True, "message_id": gen_id},  # 缺文件防御
+        {"type": "end", "data": "", "streaming": False, "message_id": gen_id},
+    ]
+    await feed_frames(gen_id, frames)
+    entry = chat_service._GENERATIONS[gen_id]
+    await asyncio.wait_for(entry["task"], timeout=10)
+    db = plugin.context.db
+
+    check("D7-1 媒体帧注册 db（缺文件跳过）", len(db.attachments) == db_count_before + 2, str(db.attachments))
+    atts = list(db.attachments.values())[-2:]
+    check("D7-2 db type/落盘路径", {a.type for a in atts} == {"image", "file"} and all(a.path.startswith(str(hostdir)) for a in atts), str(atts))
+    bot_rows = [r for r in plugin.context.message_history_manager.rows if r.content.get("type") == "bot"]
+    media_parts = [p for p in bot_rows[0].content["message"] if p["type"] in ("image", "file")] if bot_rows else []
+    check("D7-3 bot parts 含媒体段（attachment_id）", len(media_parts) == 2 and all(p.get("attachment_id") for p in media_parts), str(media_parts))
+    file_part = next((p for p in media_parts if p["type"] == "file"), {})
+    check("D7-4 file 展示名/stored_filename", file_part.get("filename") == "原始名.bin" and file_part.get("stored_filename") == "store.bin", str(file_part))
+    result = await conversation_service.page_history(plugin.context, sandbox, cid, 1, 30)
+    bot_msg = result["messages"][-1]
+    check(
+        "D7-5 助手 attachments 索引反查",
+        [a["kind"] for a in bot_msg.get("attachments") or []] == ["image", "file"]
+        and bot_msg["attachments"][0]["name"] == "bot_pic.png" and bot_msg["attachments"][1]["name"] == "原始名.bin",
+        str(bot_msg.get("attachments")),
+    )
+    check("D7-6 媒体帧不产 SSE 事件（仅 done）", [e["event"] for e in entry["buffer"]] == ["done"])
+    check("D7-7 队列已清理", gen_id not in _stub_queue_mgr().back_queues)
+
+
+async def _test_chat_concurrent_send() -> None:
+    print("== D8. 并发 send 竞态（TOCTOU 回归）==")
+    chat_service._GENERATIONS.clear()
+    sandbox = fresh_sandbox()
+    plugin = make_plugin(sandbox)
+    cid = (await conversation_service.create_conversation(plugin.context, None, None))["cid"]
+
+    results = await asyncio.gather(
+        chat_service.start_generation(plugin, cid, "并发甲"),
+        chat_service.start_generation(plugin, cid, "并发乙"),
+        return_exceptions=True,
+    )
+    ok = [r for r in results if isinstance(r, str)]
+    busy = [r for r in results if isinstance(r, chat_service.SessionBusyError)]
+    check("D8-1 同 cid 并发恰一条放行", len(ok) == 1 and len(busy) == 1, f"ok={ok} busy={len(busy)}")
+    check("D8-2 放行者持 single-flight 锁", chat_service.active_generation_id(cid) == ok[0])
+    check("D8-3 被拒者未落用户消息", len([r for r in plugin.context.message_history_manager.rows if r.content.get("type") == "user"]) == 1)
+    await feed_frames(ok[0], [{"type": "end", "data": "", "streaming": False, "message_id": ok[0]}])
+    await asyncio.wait_for(chat_service._GENERATIONS[ok[0]]["task"], timeout=5)
+
+    chat_service._GENERATIONS.clear()  # 第一段已终态，清表无泄漏
+    plugin2 = make_plugin(sandbox, config={"max_concurrent_generations": 1})
+    c1 = (await conversation_service.create_conversation(plugin2.context, None, None))["cid"]
+    c2 = (await conversation_service.create_conversation(plugin2.context, None, None))["cid"]
+    results2 = await asyncio.gather(
+        chat_service.start_generation(plugin2, c1, "并发一"),
+        chat_service.start_generation(plugin2, c2, "并发二"),
+        return_exceptions=True,
+    )
+    ok2 = [r for r in results2 if isinstance(r, str)]
+    limit = [r for r in results2 if isinstance(r, chat_service.ConcurrencyLimitError)]
+    check("D8-4 limit=1 并发恰一条放行", len(ok2) == 1 and len(limit) == 1, f"ok={len(ok2)} limit={len(limit)}")
+    check("D8-5 活跃任务数不超过上限", chat_service._active_count() == 1)
+    for gen_id in ok2:
+        await feed_frames(gen_id, [{"type": "end", "data": "", "streaming": False, "message_id": gen_id}])
+    await asyncio.wait_for(asyncio.gather(*(chat_service._GENERATIONS[g]["task"] for g in ok2)), timeout=5)
+    check("D8-6 全部收尾后活跃归零", chat_service._active_count() == 0)
+
+
+async def _test_delete_while_generating() -> None:
+    print("== D9. 删除生成中的会话（取消消费任务先行，已删历史不复活）==")
+    chat_service._GENERATIONS.clear()
+    sandbox = fresh_sandbox()
+    plugin = make_plugin(sandbox)
+    cid = (await conversation_service.create_conversation(plugin.context, None, None))["cid"]
+    gen_id = await chat_service.start_generation(plugin, cid, "会被中止的消息")
+    entry = chat_service._GENERATIONS[gen_id]
+    await feed_frames(gen_id, [{"type": "plain", "data": "部分", "streaming": True, "chain_type": None, "message_id": gen_id}])
+    check("D9-0 挂起生成已有增量", await wait_for(lambda: len(entry["buffer"]) > 0))
+
+    # routes.delete 流程：先取消消费任务（落终态、等收尾），再级联删除
+    await chat_service.cancel_generation_tasks(cid, wait=True)
+    check("D9-1 取消后任务收尾（cancelled）", entry["task"].done() and entry["task"].cancelled())
+    check("D9-2 取消前落 stopped 终态", [e["event"] for e in entry["buffer"]] == ["text_delta", "stopped"])
+    check("D9-3 取消路径队列已清理", gen_id not in _stub_queue_mgr().back_queues)
+    check("D9-4 取消路径不落 bot 历史（半截内容不复活）", not [r for r in plugin.context.message_history_manager.rows if r.content.get("type") == "bot"])
+
+    await conversation_service.delete_conversation(plugin.context, cid, sandbox)
+    check("D9-5 platform_session 级联删除", cid in plugin.context.db.deleted_sessions)
+    check("D9-6 平台历史级联清空", plugin.context.message_history_manager.rows == [])
+    check("D9-7 历史 offset_sec=99999999", any(d["offset_sec"] == 99999999 and d["user_id"] == cid for d in plugin.context.message_history_manager.deleted_offsets))
+    check("D9-8 宿主会话级联删除", pipeline_bridge.build_umo(cid) in plugin.context.conversation_manager.deleted_by_user)
+    check("D9-9 remove_queues（会话队列+back 队列）", cid not in _stub_queue_mgr().queues and gen_id not in _stub_queue_mgr().back_queues)
+    check("D9-10 删除后无活跃任务", chat_service.active_generation_id(cid) is None)
+
+
+async def _test_sse_ping() -> None:
+    print("== J6. SSE 保活 ping（空闲超时发帧，不占业务 seq）==")
+    chat_service._GENERATIONS.clear()
+    sandbox = fresh_sandbox()
+    plugin = make_plugin(sandbox)
+    cid = (await conversation_service.create_conversation(plugin.context, None, None))["cid"]
+    gen_id = await chat_service.start_generation(plugin, cid, "挂着的生成")
+    entry = chat_service._GENERATIONS[gen_id]
+    await feed_frames(gen_id, [{"type": "plain", "data": "慢", "streaming": True, "chain_type": None, "message_id": gen_id}])
+    check("J6-0 业务帧已缓冲", await wait_for(lambda: len(entry["buffer"]) > 0))
+
+    real_interval = routes.SSE_PING_INTERVAL_SECONDS
+    try:
+        routes.SSE_PING_INTERVAL_SECONDS = 0.05  # 缩短空闲阈值，测试可观测
+        stream = await routes.handle_stream(plugin, gen_id)
+        check("J6-1 stream 200", stream["__type"] == "stream" and stream["status"] == 200)
+        frames: list[str] = []
+        consumer = asyncio.ensure_future(_collect_frames(stream["content"], frames, limit=3))
+        done = await wait_for(lambda: len(frames) >= 3, timeout=2.0)
+        consumer.cancel()
+        try:
+            await consumer
+        except (asyncio.CancelledError, StopAsyncIteration):
+            pass
+        check("J6-2 空闲期收到 ping 帧", done and any("event: ping" in f for f in frames), str(frames))
+        check("J6-3 ping 不带业务 seq 且帧格式合法", all('"seq"' not in f for f in frames if "event: ping" in f), str(frames))
+        check("J6-4 业务帧仍在 ping 之前重放", bool(frames) and frames[0].startswith("event: text_delta"), frames[:1])
+    finally:
+        routes.SSE_PING_INTERVAL_SECONDS = real_interval
+        await chat_service.abort_generation(gen_id)
+        await feed_frames(gen_id, [{"type": "end", "data": "", "streaming": False, "message_id": gen_id}])
+        check("J6-5 收尾后任务退出（不泄漏挂起排水）", await wait_for(lambda: entry["task"] is None or entry["task"].done(), timeout=5))
+
+
+async def _collect_frames(source, frames: list[str], limit: int) -> None:
+    """消费 SSE 帧生成器直到取满 limit 帧（测试辅助）。"""
+    async for frame in source:
+        frames.append(frame)
+        if len(frames) >= limit:
+            return
 
 
 # ---------------------------------------------------------------------------
@@ -828,52 +1174,64 @@ def test_attachment_unit() -> None:
         ),
     )
     check(
-        "H1-5 resolve_persona_tools 语义",
-        persona_service.resolve_persona_tools(None) == (True, None)
-        and persona_service.resolve_persona_tools([]) == (False, set())
-        and persona_service.resolve_persona_tools(["a", "b"]) == (True, {"a", "b"}),
+        "H1-5 usage_from_agent_stats（AgentStats.to_dict）",
+        pipeline_bridge.usage_from_agent_stats({"token_usage": {"input_other": 3, "input_cached": 2, "output": 5}}) == {"output": 5, "total": 10}
+        and pipeline_bridge.usage_from_agent_stats(None) == {"output": 0, "total": 0}
+        and pipeline_bridge.usage_from_agent_stats({"token_usage": "bad"}) == {"output": 0, "total": 0},
     )
     check(
-        "H1-6 附件区块格式",
-        attachment_service.build_attachment_block("a.md", "内容")
-        == '<attachment name="a.md">\n内容\n</attachment>',
+        "H1-6 媒体帧 data 解析（[IMAGE]/[FILE]display）",
+        pipeline_bridge._split_media_payload("image", "[IMAGE]a.png") == ("a.png", None)
+        and pipeline_bridge._split_media_payload("file", "[FILE]store.bin|原始名.bin") == ("store.bin", "原始名.bin")
+        and pipeline_bridge._split_media_payload("record", "[RECORD]x.wav") == ("x.wav", None)
+        and pipeline_bridge._split_media_payload("image", "[IMAGE]../evil.png") == ("evil.png", None),
     )
 
 
 async def _test_attachment_store() -> None:
-    print("== H2. store_upload / 索引 / 截断 ==")
+    print("== H2. store_upload / 宿主附件区 / db 注册 / 索引 / 截断 ==")
     sandbox = fresh_sandbox()
     config = {"attachment_text_whitelist": ["txt", "md"], "upload_image_max_mb": 1, "upload_text_max_kb": 200}
+    plugin = make_plugin(sandbox)
+    attachments_dir = sandbox / "host-attachments"
+    attachments_dir.mkdir(parents=True, exist_ok=True)
+
+    def store(upload):
+        return attachment_service.store_upload(upload, plugin.context, config, sandbox, attachments_dir=attachments_dir)
 
     text_upload = FakeUpload("notes.md", "text/markdown", "# 标题\n正文内容".encode("utf-8"))
-    meta_text = await attachment_service.store_upload(text_upload, sandbox, config)
+    meta_text = await store(text_upload)
     check("H2-1 文本元数据契约键", set(meta_text.keys()) == {"file_id", "kind", "name", "size", "mime", "preview", "truncated"}, str(meta_text.keys()))
     check("H2-2 file_id 前缀", meta_text["file_id"].startswith("f_") and len(meta_text["file_id"]) == 34)
     check("H2-3 truncated False", meta_text["truncated"] is False)
     check("H2-4 preview 前 500 字符", meta_text["preview"].startswith("# 标题"))
     check("H2-5 mime text/markdown", meta_text["mime"] == "text/markdown")
-    check("H2-6 落盘 uploads/<yyyyMM>/", text_upload.saved_to is not None and text_upload.saved_to.parent.name == datetime.now(timezone.utc).strftime("%Y%m") and text_upload.saved_to.name.startswith(meta_text["file_id"]))
+    check("H2-6 落盘宿主附件区（file_id 前缀命名）", text_upload.saved_to is not None and text_upload.saved_to.parent == attachments_dir and text_upload.saved_to.name.startswith(meta_text["file_id"]))
     check("H2-7 磁盘名同源 file_id", f"{meta_text['file_id']}_" in text_upload.saved_to.name)
+    check("H2-7b db 注册取得 attachment_id（type=file）", bool(meta_text["file_id"]) and plugin.context.db.attachments and list(plugin.context.db.attachments.values())[0].type == "file", str(plugin.context.db.attachments))
 
     meta = await attachment_service.get_file(sandbox, meta_text["file_id"])
     check(
-        "H2-8 索引登记（含内部字段）",
-        meta is not None and meta["cid"] is None and meta["path"].startswith("uploads/"),
+        "H2-8 索引登记（含 attachment_id 内部字段 + 绝对路径）",
+        meta is not None and meta["cid"] is None and bool(meta.get("attachment_id")) and Path(meta["path"]).is_absolute() and meta["path"].startswith(attachments_dir.resolve().as_posix()),
         str(meta),
     )
-    check("H2-9 public_meta 剥离内部字段", "path" not in attachment_service.public_meta(meta) and "cid" not in attachment_service.public_meta(meta))
+    check("H2-9 public_meta 剥离内部字段", "path" not in attachment_service.public_meta(meta) and "cid" not in attachment_service.public_meta(meta) and "attachment_id" not in attachment_service.public_meta(meta))
+    check("H2-9b 按 attachment_id 反查", (await attachment_service.find_by_attachment_id(sandbox, meta["attachment_id"]))["file_id"] == meta_text["file_id"])
 
     png = FakeUpload("pic.png", "image/png", b"\x89PNG\r\n\x1a\nfake")
-    meta_img = await attachment_service.store_upload(png, sandbox, config)
+    meta_img = await store(png)
     check("H2-10 图片 kind/mime", meta_img["kind"] == "image" and meta_img["mime"] == "image/png")
     check("H2-11 图片无 truncated 键", "truncated" not in meta_img)
     check("H2-12 图片 preview 缺省或 data URL（无 PIL 环境降级，真机为 data URL）", "preview" not in meta_img or meta_img["preview"] is None or str(meta_img["preview"]).startswith("data:image/"))
     check("H2-13 图片按 max_bytes 落盘", png.save_max_bytes == 1 * 1024 * 1024)
+    meta_img_full = await attachment_service.get_file(sandbox, meta_img["file_id"])
+    check("H2-13b db 注册 type=image", meta_img_full is not None and plugin.context.db.attachments.get(meta_img_full.get("attachment_id") or "", None) is not None and getattr(plugin.context.db.attachments[meta_img_full["attachment_id"]], "type", "") == "image", str(meta_img_full))
 
     # 文本截断：300KB > 200KB -> truncated=True；磁盘保留全文
     big = ("甲" * 200).encode("utf-8") * 1600  # 200 字符 * 3字节 * 1600 ≈ 960KB
     big_upload = FakeUpload("big.txt", "text/plain", big)
-    meta_big = await attachment_service.store_upload(big_upload, sandbox, config)
+    meta_big = await store(big_upload)
     check("H2-14 文本超限 truncated=True", meta_big["truncated"] is True)
     check("H2-15 磁盘保留全文", meta_big["size"] == len(big))
     content, truncated = attachment_service.extract_text_content(big_upload.saved_to, 200)
@@ -886,7 +1244,7 @@ async def _test_attachment_store() -> None:
     # 图片超限 -> UploadTooLargeError（routes -> 413）
     over = FakeUpload("big.png", "image/png", b"x" * (1024 * 1024 + 128))
     try:
-        await attachment_service.store_upload(over, sandbox, config)
+        await store(over)
         check("H2-18 图片超限 413 前置", False)
     except attachment_service.UploadTooLargeError:
         check("H2-18 图片超限 413 前置", True)
@@ -894,7 +1252,7 @@ async def _test_attachment_store() -> None:
     # 白名单外 -> UnsupportedMediaTypeError（routes -> 415）
     exe = FakeUpload("virus.exe", "application/x-msdownload", b"MZ")
     try:
-        await attachment_service.store_upload(exe, sandbox, config)
+        await store(exe)
         check("H2-19 白名单外 415 前置", False)
     except attachment_service.UnsupportedMediaTypeError:
         check("H2-19 白名单外 415 前置", True)
@@ -913,15 +1271,22 @@ async def _test_orphan_sweep() -> None:
     sandbox = fresh_sandbox()
     now = datetime.now(timezone.utc)
     config = {**_schema_defaults(), "attachment_text_whitelist": ["txt"]}
-    old_orphan = await attachment_service.store_upload(FakeUpload("old.txt", "text/plain", b"old"), sandbox, config)
-    new_orphan = await attachment_service.store_upload(FakeUpload("new.txt", "text/plain", b"new"), sandbox, config)
-    bound_old = await attachment_service.store_upload(FakeUpload("bound.txt", "text/plain", b"bound"), sandbox, config)
+    plugin = make_plugin(sandbox)
+    attachments_dir = sandbox / "host-attachments"
+    attachments_dir.mkdir(parents=True, exist_ok=True)
+
+    def store(upload):
+        return attachment_service.store_upload(upload, plugin.context, config, sandbox, attachments_dir=attachments_dir)
+
+    old_orphan = await store(FakeUpload("old.txt", "text/plain", b"old"))
+    new_orphan = await store(FakeUpload("new.txt", "text/plain", b"new"))
+    bound_old = await store(FakeUpload("bound.txt", "text/plain", b"bound"))
     await attachment_service.bind_file(sandbox, bound_old["file_id"], "c1")
     # 把 old_orphan 的登记时间改为 25h 前（sweep 可注入 now，不改全局时钟）
     index = await attachment_service._load_index(sandbox)
     index["files"][old_orphan["file_id"]]["created_at"] = (now - timedelta(hours=25)).isoformat()
     await attachment_service._save_index(sandbox, index)
-    old_disk = sandbox / index["files"][old_orphan["file_id"]]["path"]
+    old_disk = Path(index["files"][old_orphan["file_id"]]["path"])  # v0.2 索引存绝对路径
 
     removed = await attachment_service.sweep_orphans(sandbox, now=now)
     check("H3-1 仅清理超 24h 未引用孤儿", removed == 1)
@@ -930,7 +1295,6 @@ async def _test_orphan_sweep() -> None:
     check("H3-4 已引用不清理", await attachment_service.get_file(sandbox, bound_old["file_id"]) is not None)
 
     # 后台任务生命周期：启动 -> 运行中 -> 取消
-    plugin = make_plugin(sandbox, provider=None)
     await attachment_service.start_orphan_cleanup(plugin)
     task = attachment_service._CLEANUP_TASK
     check("H3-5 清理任务已启动", task is not None and not task.done())
@@ -940,332 +1304,6 @@ async def _test_orphan_sweep() -> None:
     check("H3-7 清理任务已取消", task.done())
     await attachment_service.stop_orphan_cleanup()  # 幂等
     check("H3-8 幂等停止", attachment_service._CLEANUP_TASK is None)
-
-
-# ---------------------------------------------------------------------------
-# I. tool_loop.py：ToolSet 过滤 / 工具执行 / 调用解析 / 回填构造
-# ---------------------------------------------------------------------------
-
-
-def test_tool_loop_unit() -> None:
-    print("== I1. tool_loop 纯函数 ==")
-    calls_final = SimpleNamespace(
-        tools_call_name=["a", "b"],
-        tools_call_args=[{"x": 1}, '{"y": 2}'],
-        tools_call_ids=["call_0", "call_1"],
-    )
-    calls = tool_loop.extract_tool_calls(calls_final)
-    check("I1-1 工具调用解析", calls == [{"id": "call_0", "name": "a", "args": {"x": 1}}, {"id": "call_1", "name": "b", "args": {"y": 2}}], str(calls))
-    check("I1-2 空响应解析", tool_loop.extract_tool_calls(None) == [])
-    check("I1-3 缺 ids 兜底编号", tool_loop.extract_tool_calls(SimpleNamespace(tools_call_name=["a"]))[0]["id"] == "call_0")
-
-    result = tool_loop.build_tool_calls_result(["c1"], ["get_weather"], ['{"location": "北京"}'], ["晴"], "done")
-    check(
-        "I1-4 ToolCallsResult 主候选字段构造",
-        getattr(result, "func_name", None) == ["get_weather"]
-        and getattr(result, "func_args", None) == ['{"location": "北京"}']
-        and getattr(result, "func_result", None) == ["晴"]
-        and getattr(result, "completion_text", None) == "done",
-    )
-
-    ok, err = asyncio.run(tool_loop.execute_tool(FakeTool("t", result="结果"), object(), "t", {"a": 1}))
-    check("I1-5 工具执行成功", ok == "结果" and err is None)
-    ok, err = asyncio.run(tool_loop.execute_tool(FakeTool("t", error="炸了"), object(), "t", {}))
-    check("I1-6 工具执行失败转 error 文本", ok is None and "炸了" in (err or ""))
-    ok, err = asyncio.run(tool_loop.execute_tool(object(), object(), "t", {}))
-    check("I1-7 无 call 接口转 error 文本", ok is None and err is not None)
-
-
-async def _test_tool_set_filter() -> None:
-    print("== I2. build_toolset 人格 tools 语义 ==")
-    sandbox = fresh_sandbox()
-    plugin = make_plugin(sandbox, provider=None)
-    tool_a, tool_b = FakeTool("get_weather"), FakeTool("search")
-    plugin.context.tool_manager = FakeToolManager([tool_a, tool_b])
-
-    toolset, objs = tool_loop.build_toolset(plugin, {"tools": None})
-    check("I2-1 None=全部工具", toolset is not None and set(objs) == {"get_weather", "search"})
-    toolset, objs = tool_loop.build_toolset(plugin, {"tools": []})
-    check("I2-2 空列表=禁用", toolset is None and objs == {})
-    toolset, objs = tool_loop.build_toolset(plugin, {"tools": ["search"]})
-    check("I2-3 列表=白名单", toolset is not None and set(objs) == {"search"})
-    plugin.context.tool_manager = None
-    toolset, objs = tool_loop.build_toolset(plugin, {"tools": None})
-    check("I2-4 无工具管理器 -> 无工具", toolset is None and objs == {})
-
-
-# ---------------------------------------------------------------------------
-# J. chat_service 集成：工具循环 / 富历史 tools / 多模态错误 / 附件链路
-# ---------------------------------------------------------------------------
-
-
-async def _test_chat_tool_loop() -> None:
-    print("== J1. 方案 A 流式工具循环端到端 ==")
-    chat_service._GENERATIONS.clear()
-    sandbox = fresh_sandbox()
-    round1_final = SimpleNamespace(
-        is_chunk=False,
-        result_chain=FakeChain(""),
-        completion_text="",
-        reasoning_content=None,
-        reasoning_signature=None,
-        usage=None,
-        tools_call_name=["get_weather"],
-        tools_call_args=[{"location": "北京"}],
-        tools_call_ids=["call_1"],
-    )
-    provider = FakeProvider(
-        [
-            [round1_final],
-            [_chunk("今天"), _final("今天北京晴", None, {"input": 3, "output": 7})],
-        ]
-    )
-    plugin = make_plugin(sandbox, provider)
-    tool = FakeTool("get_weather", result="晴 26℃")
-    plugin.context.tool_manager = FakeToolManager([tool])
-    cid = (await conversation_service.create_conversation(plugin.context, "p1", None))["cid"]
-
-    gen_id = await chat_service.start_generation(plugin, cid, "北京天气怎么样")
-    entry = chat_service._GENERATIONS[gen_id]
-    await await_task(entry["task"])
-
-    events = await chat_service.replay_events(gen_id)
-    types = [e["event"] for e in events]
-    check("J1-1 事件序列 tool_call/tool_result/text_delta/done", types == ["tool_call", "tool_result", "text_delta", "done"], str(types))
-    check("J1-2 tool_call 事件契约", events[0]["data"] == {"seq": 0, "phase": "start", "id": "call_1", "name": "get_weather", "args": {"location": "北京"}}, str(events[0]["data"]))
-    tr = events[1]["data"]
-    check("J1-3 tool_result 事件契约", tr.get("id") == "call_1" and tr.get("result") == "晴 26℃" and isinstance(tr.get("elapsed_ms"), int) and "error" not in tr, str(tr))
-    check("J1-4 工具真实执行", tool.calls == [{"location": "北京"}])
-    check("J1-5 done usage", events[3]["data"]["usage"] == {"output": 7, "total": 10})
-    check("J1-6 第二轮 func_tool/tool_calls_result", provider.calls[0].get("func_tool") is not None and provider.calls[1].get("func_tool") is not None and provider.calls[1].get("tool_calls_result") is not None)
-    tc_result = provider.calls[1]["tool_calls_result"]
-    check("J1-7 回填内容", list(getattr(tc_result, "func_name", [])) == ["get_weather"] and "晴 26℃" in list(getattr(tc_result, "func_result", [""]))[0])
-
-    doc = await uistore.load_conversation(sandbox, cid)
-    assistant = doc["messages"][-1]
-    check("J1-8 富历史含工具步骤", assistant["role"] == "assistant" and len(assistant["tools"]) == 1 and assistant["tools"][0]["name"] == "get_weather" and assistant["tools"][0]["result"] == "晴 26℃" and "elapsed_ms" in assistant["tools"][0], str(assistant.get("tools")))
-    pair = plugin.context.conversation_manager.pairs[-1]
-    check("J1-9 权威历史落最终文本", pair[2] == {"role": "assistant", "content": "今天北京晴"})
-
-
-async def _test_chat_tool_loop_agent() -> None:
-    print("== J2. 方案 B tool_loop_agent 模式 ==")
-    chat_service._GENERATIONS.clear()
-    sandbox = fresh_sandbox()
-    provider = FakeProvider([[_chunk("x"), _final("x", None, None)]])  # 不应被消费
-    plugin = make_plugin(sandbox, provider, config={"tool_loop_mode": "loop_agent"})
-    plugin.context.tool_manager = FakeToolManager([FakeTool("get_weather")])
-    cid = (await conversation_service.create_conversation(plugin.context, "p1", None))["cid"]
-
-    gen_id = await chat_service.start_generation(plugin, cid, "北京天气")
-    entry = chat_service._GENERATIONS[gen_id]
-    await await_task(entry["task"])
-
-    events = await chat_service.replay_events(gen_id)
-    types = [e["event"] for e in events]
-    check("J2-1 方案 B 走宿主循环", plugin.context.agent_calls and provider.calls == [], f"provider.calls={provider.calls}")
-    check("J2-2 钩子产生工具事件", [t for t in types if t in ("tool_call", "tool_result")] == ["tool_call", "tool_result"], str(types))
-    check("J2-3 done 正文来自宿主响应", events[-1]["event"] == "done" and events[-1]["data"]["usage"] == {"output": 4, "total": 6})
-    doc = await uistore.load_conversation(sandbox, cid)
-    check("J2-4 富历史正文", doc["messages"][-1]["text"] == "宿主循环答案" and doc["messages"][-1]["tools"][0]["result"] == "晴 26℃")
-
-
-async def _test_chat_tool_degrade() -> None:
-    print("== J3. 方案 A -> 方案 B -> 无工具 降级阶梯 ==")
-    chat_service._GENERATIONS.clear()
-    sandbox = fresh_sandbox()
-    provider = FakeProvider([[_chunk("直接答案"), _final("直接答案", None, {"output": 2})]])
-    plugin = make_plugin(sandbox, provider)
-    plugin.context.tool_manager = FakeToolManager([FakeTool("get_weather")])
-    cid = (await conversation_service.create_conversation(plugin.context, "p1", None))["cid"]
-
-    real_build = tool_loop.build_exec_context
-    try:
-        tool_loop.build_exec_context = lambda plugin_: None  # 令方案 A 不可用
-        gen_id = await chat_service.start_generation(plugin, cid, "带工具提问")
-        entry = chat_service._GENERATIONS[gen_id]
-        await await_task(entry["task"])
-    finally:
-        tool_loop.build_exec_context = real_build
-
-    events = await chat_service.replay_events(gen_id)
-    types = [e["event"] for e in events]
-    nonfatal = [e["data"] for e in events if e["event"] == "error"]
-    check("J3-1 降级提示非致命", any(e.get("fatal") is False and "改用宿主逐步执行" in e.get("message", "") for e in nonfatal), str(nonfatal))
-    check("J3-2 降级走方案 B", bool(plugin.context.agent_calls))
-    check("J3-3 最终仍 done", types[-1] == "done" and plugin.context.conversation_manager.pairs[-1][2]["content"] == "宿主循环答案")
-
-
-async def _test_chat_multimodal_error() -> None:
-    print("== J4. 图片被拒 -> error{code:model_not_multimodal} ==")
-    chat_service._GENERATIONS.clear()
-    sandbox = fresh_sandbox()
-
-    class _NoImageProvider:
-        def text_chat_stream(self, **kwargs):
-            return self._gen()
-
-        async def _gen(self):
-            raise RuntimeError("model does not support image input")
-            yield  # pragma: no cover
-
-    plugin = make_plugin(sandbox, _NoImageProvider())  # type: ignore[arg-type]
-    cid = (await conversation_service.create_conversation(plugin.context, "p1", None))["cid"]
-    gen_id = await chat_service.start_generation(plugin, cid, "看这张图", image_urls=["/tmp/a.png"])
-    await await_task(chat_service._GENERATIONS[gen_id]["task"])
-    events = await chat_service.replay_events(gen_id)
-    err = events[-1]["data"]
-    check("J4-1 error code=model_not_multimodal", events[-1]["event"] == "error" and err.get("fatal") is True and err.get("code") == "model_not_multimodal", str(err))
-
-    # 无图片的普通错误仍为 server_error（D5 已覆盖）；此处验证图片错误启发式不含关键词时回落
-    chat_service._GENERATIONS.clear()
-
-    class _OtherProvider:
-        def text_chat_stream(self, **kwargs):
-            return self._gen()
-
-        async def _gen(self):
-            raise RuntimeError("quota exceeded")
-            yield  # pragma: no cover
-
-    plugin2 = make_plugin(sandbox, _OtherProvider())  # type: ignore[arg-type]
-    cid2 = (await conversation_service.create_conversation(plugin2.context, "p1", None))["cid"]
-    gen2 = await chat_service.start_generation(plugin2, cid2, "看这张图", image_urls=["/tmp/a.png"])
-    await await_task(chat_service._GENERATIONS[gen2]["task"])
-    err2 = (await chat_service.replay_events(gen2))[-1]["data"]
-    check("J4-2 非多模态错误回落 server_error", err2.get("code") == "server_error")
-
-
-async def _test_chat_text_attachment() -> None:
-    print("== J5. 文本附件注入 prompt ==")
-    chat_service._GENERATIONS.clear()
-    sandbox = fresh_sandbox()
-    provider = FakeProvider([[_final("收到", None, None)]])
-    plugin = make_plugin(sandbox, provider)
-    cid = (await conversation_service.create_conversation(plugin.context, "p1", None))["cid"]
-    block = attachment_service.build_attachment_block("a.md", "文件内容")
-    meta = [{"file_id": "f_x", "kind": "text", "name": "a.md", "size": 12, "mime": "text/markdown", "preview": "文件内容", "truncated": False}]
-    gen_id = await chat_service.start_generation(plugin, cid, "总结附件", attachment_blocks=[block], attachment_meta=meta)
-    await await_task(chat_service._GENERATIONS[gen_id]["task"])
-    check("J5-1 prompt 拼附件区块", provider.calls[0]["prompt"] == f"总结附件\n\n{block}")
-    doc = await uistore.load_conversation(sandbox, cid)
-    check("J5-2 user 消息 attachments 同构", doc["messages"][0]["attachments"] == meta)
-    # 仅附件无文本：prompt 为附件区块本身
-    chat_service._GENERATIONS.clear()
-    provider2 = FakeProvider([[_final("收到", None, None)]])
-    plugin2 = make_plugin(sandbox, provider2)
-    cid2 = (await conversation_service.create_conversation(plugin2.context, "p1", None))["cid"]
-    gen2 = await chat_service.start_generation(plugin2, cid2, "", attachment_blocks=[block], attachment_meta=meta)
-    await await_task(chat_service._GENERATIONS[gen2]["task"])
-    check("J5-3 纯附件 prompt", provider2.calls[0]["prompt"] == block)
-
-
-async def _test_chat_concurrent_send() -> None:
-    print("== D7. 并发 send 竞态（TOCTOU 修复回归）==")
-    # 同 cid 并发：占位登记与检查间无 await，第二条必须拿到 409
-    chat_service._GENERATIONS.clear()
-    sandbox = fresh_sandbox()
-    provider = FakeProvider([[_chunk("一"), asyncio.Event()], [_chunk("二"), asyncio.Event()]])
-    provider.gate = asyncio.Event()
-    plugin = make_plugin(sandbox, provider)
-    cid = (await conversation_service.create_conversation(plugin.context, "p1", None))["cid"]
-
-    results = await asyncio.gather(
-        chat_service.start_generation(plugin, cid, "并发甲"),
-        chat_service.start_generation(plugin, cid, "并发乙"),
-        return_exceptions=True,
-    )
-    ok = [r for r in results if isinstance(r, str)]
-    busy = [r for r in results if isinstance(r, chat_service.SessionBusyError)]
-    check("D7-1 同 cid 并发恰一条放行", len(ok) == 1 and len(busy) == 1, f"ok={ok} busy={len(busy)} other={[r for r in results if not isinstance(r, (str, chat_service.SessionBusyError))]}")
-    check("D7-2 放行者持 single-flight 锁", chat_service.active_generation_id(cid) == ok[0])
-    doc_d7 = await uistore.load_conversation(sandbox, cid)
-    check("D7-3 被拒者未写用户消息（仅 1 条 user）", len([m for m in doc_d7["messages"] if m["role"] == "user"]) == 1, str(len(doc_d7["messages"])))
-
-    # 不同 cid 并发 + limit=1：并发上限同样不再被穿透
-    chat_service._GENERATIONS.clear()
-    plugin2 = make_plugin(sandbox, provider, config={"max_concurrent_generations": 1})
-    c1 = (await conversation_service.create_conversation(plugin2.context, None, None))["cid"]
-    c2 = (await conversation_service.create_conversation(plugin2.context, None, None))["cid"]
-    results2 = await asyncio.gather(
-        chat_service.start_generation(plugin2, c1, "并发一"),
-        chat_service.start_generation(plugin2, c2, "并发二"),
-        return_exceptions=True,
-    )
-    ok2 = [r for r in results2 if isinstance(r, str)]
-    limit = [r for r in results2 if isinstance(r, chat_service.ConcurrencyLimitError)]
-    check("D7-4 limit=1 并发恰一条放行", len(ok2) == 1 and len(limit) == 1, f"ok={len(ok2)} limit={len(limit)}")
-    check("D7-5 活跃任务数不超过上限", chat_service._active_count() == 1)
-    provider.gate.set()  # 收尾
-    for gen_id, entry in list(chat_service._GENERATIONS.items()):
-        await await_task(entry["task"])
-    check("D7-6 全部收尾后活跃归零", chat_service._active_count() == 0)
-
-
-async def _test_delete_while_generating() -> None:
-    print("== D8. 删除生成中的会话（中止收尾先行，富历史不复活）==")
-    chat_service._GENERATIONS.clear()
-    sandbox = fresh_sandbox()
-    provider = FakeProvider([[_chunk("开头"), asyncio.Event()]])
-    provider.gate = asyncio.Event()  # 挂起：模拟生成中
-    plugin = make_plugin(sandbox, provider)
-    cid = (await conversation_service.create_conversation(plugin.context, "p1", None))["cid"]
-    gen_id = await chat_service.start_generation(plugin, cid, "会被中止的消息")
-    entry = chat_service._GENERATIONS[gen_id]
-    await wait_for(lambda: any(e["event"] == "text_delta" for e in entry["buffer"]))
-
-    # abort(wait=True) 等中止分支（partial 富历史/权威历史写入）完成后，删除才执行
-    check("D8-1 abort(wait=True) 成功", await chat_service.abort_generation(gen_id, wait=True) is True)
-    check("D8-2 任务已彻底收尾", entry["task"].done())
-    partial_doc = await uistore.load_conversation(sandbox, cid)
-    check("D8-3 中止部分回复已落盘（删除前）", partial_doc["messages"][-1].get("text") == "开头")
-
-    await conversation_service.delete_conversation(plugin.context, cid, sandbox)
-    history_file = sandbox / "ui_history" / f"{cid}.json"
-    check("D8-4 删除后富历史不复活", not history_file.exists())
-    check("D8-5 删除后无活跃任务", chat_service.active_generation_id(cid) is None)
-    await await_task(entry["task"])  # 双保险收尾（wait=True 已完成，此处幂等）
-
-
-async def _test_sse_ping() -> None:
-    print("== J6. SSE 保活 ping（空闲超时发帧，不杀底层流）==")
-    chat_service._GENERATIONS.clear()
-    sandbox = fresh_sandbox()
-    provider = FakeProvider([[_chunk("慢"), asyncio.Event()]])
-    provider.gate = asyncio.Event()  # 永不置位：生成挂起，流空闲
-    plugin = make_plugin(sandbox, provider)
-    cid = (await conversation_service.create_conversation(plugin.context, "p1", None))["cid"]
-    gen_id = await chat_service.start_generation(plugin, cid, "挂着的生成")
-    entry = chat_service._GENERATIONS[gen_id]
-    await wait_for(lambda: len(entry["buffer"]) > 0)
-
-    real_interval = routes.SSE_PING_INTERVAL_SECONDS
-    try:
-        routes.SSE_PING_INTERVAL_SECONDS = 0.05  # 缩短空闲阈值，测试可观测
-        stream = await routes.handle_stream(plugin, gen_id)
-        check("J6-1 stream 200", stream["__type"] == "stream" and stream["status"] == 200)
-        frames: list[str] = []
-        consumer = asyncio.ensure_future(_collect_frames(stream["content"], frames, limit=3))
-        done = await wait_for(lambda: len(frames) >= 3, timeout=2.0)
-        consumer.cancel()
-        try:
-            await consumer
-        except (asyncio.CancelledError, StopAsyncIteration):
-            pass
-        check("J6-2 空闲期收到 ping 帧", done and any("event: ping" in f for f in frames), str(frames))
-        check("J6-3 ping 不带业务 seq 且帧格式合法", all('"seq"' not in f for f in frames if "event: ping" in f), str(frames))
-        check("J6-4 业务帧仍在 ping 之前重放", frames[0].startswith("event: text_delta"), frames[0])
-    finally:
-        routes.SSE_PING_INTERVAL_SECONDS = real_interval
-        await chat_service.abort_generation(gen_id, wait=True)
-
-
-async def _collect_frames(source, frames: list[str], limit: int) -> None:
-    """消费 SSE 帧生成器直到取满 limit 帧（测试辅助）。"""
-    async for frame in source:
-        frames.append(frame)
-        if len(frames) >= limit:
-            return
 
 
 async def _test_standalone_logic() -> None:
@@ -1316,6 +1354,60 @@ async def _test_standalone_logic() -> None:
     await standalone.stop(None)
     check("L-15 stop(None) 幂等", True)
 
+    # upload 鉴权（评审修复回归）：/api/upload 与其余 /api/* 一致，先 _verify_token
+    # 再分发；无 token/无效 token 必须 401，合法 token 才进入 upload 处理
+    class _FakeAioWeb:
+        @staticmethod
+        def json_response(data, status=200):
+            return {"status": status, "data": data}
+
+    class _FakePart:
+        def __init__(self) -> None:
+            self.name = "file"
+            self.filename = "l.txt"
+            self.headers = {"Content-Type": "text/plain"}
+            self._read = False
+
+        async def read_chunk(self, size):
+            if self._read:
+                return b""
+            self._read = True
+            return b"hello"
+
+    class _FakeMultipartReader:
+        def __init__(self, part) -> None:
+            self._part = part
+
+        async def next(self):
+            part, self._part = self._part, None
+            return part
+
+    class _FakeAioRequest:
+        def __init__(self, endpoint, headers=None, query=None, method="POST", content_type="multipart/form-data; boundary=x"):
+            self.match_info = {"endpoint": endpoint}
+            self.method = method
+            self.headers = headers or {}
+            self.query = query or {}
+            self.content_type = content_type
+
+        async def multipart(self):
+            return _FakeMultipartReader(_FakePart())
+
+    sandbox_l = fresh_sandbox()
+    set_stub_host_data(sandbox_l)
+    plugin_l = make_plugin(sandbox_l)
+    auth_headers = {"Authorization": f"Bearer {standalone._issue_token()}"}
+
+    resp = await standalone._handle_api(_FakeAioRequest("upload"), plugin_l, _FakeAioWeb())
+    check("L-16 无 token POST /api/upload 401", resp["status"] == 401 and resp["data"]["error"] == "unauthorized", str(resp))
+    resp = await standalone._handle_api(_FakeAioRequest("upload", headers={"Authorization": "Bearer bad"}), plugin_l, _FakeAioWeb())
+    check("L-17 无效 token 401", resp["status"] == 401 and resp["data"]["error"] == "unauthorized", str(resp))
+    resp = await standalone._handle_api(_FakeAioRequest("upload", headers=auth_headers), plugin_l, _FakeAioWeb())
+    check("L-18 带 token 上传 2xx（multipart 元数据）", resp["status"] == 200 and resp["data"]["kind"] == "text" and resp["data"]["file_id"].startswith("f_"), str(resp))
+    check("L-19 带 token 落盘宿主附件区 + db 注册", bool(plugin_l.context.db.attachments), str(plugin_l.context.db.attachments))
+    resp = await standalone._handle_api(_FakeAioRequest("health"), plugin_l, _FakeAioWeb())
+    check("L-20 其余 /api/* 端点无 token 依旧 401", resp["status"] == 401, str(resp))
+
 
 # ---------------------------------------------------------------------------
 # E. routes.py：精确路由注册 / 错误包 / 端点行为
@@ -1326,7 +1418,7 @@ def test_routes() -> None:
     print("== E. routes 路由表与错误包 ==")
     sandbox = fresh_sandbox()
     chat_service._GENERATIONS.clear()
-    plugin = make_plugin(sandbox, provider=None)
+    plugin = make_plugin(sandbox)
     register = routes.register_routes
     register(plugin)
     registered: dict[str, list[str]] = {}
@@ -1394,8 +1486,7 @@ def test_routes() -> None:
         check("E14 busy=该 cid 有进行中任务", busy_map.get(cid) is True)
         chat_service._GENERATIONS.clear()
 
-        # history
-        await uistore.append_message(plugin.data_dir(), cid, {"role": "user", "text": "历史消息"})
+        # history（新会话读平台历史；桩 db 空历史 -> 空 messages）
         stub_request.set_query([("page", "1"), ("size", "999")])
         resp = await call("/astrbot_plugin_webui/history/<cid>", "GET", cid=cid)
         data = resp["data"]
@@ -1414,37 +1505,33 @@ def test_routes() -> None:
         check("E19 空内容 400", resp["status"] == 400 and resp["data"]["error"] == "invalid_request")
         stub_request.set_json({"cid": cid, "text": "带附件", "file_ids": ["f_x"]})
         resp = await call("/astrbot_plugin_webui/send", "POST")
-        check("E20 M3 前 file_ids 明确 400", resp["status"] == 400)
+        check("E20 未知 file_ids 明确 400", resp["status"] == 400)
         stub_request.set_json({"cid": "missing", "text": "hi"})
         resp = await call("/astrbot_plugin_webui/send", "POST")
         check("E21 未知 cid 404", resp["status"] == 404 and resp["data"]["error"] == "not_found")
 
-        # send 正常 + session_busy
-        gate = asyncio.Event()
-        provider = FakeProvider([[_chunk("慢"), gate], [_chunk("慢"), gate]])
-        provider.gate = gate  # 挂起在闸门：模拟进行中
-        plugin.context.provider = provider
+        # send 正常（桩 webchat 队列注入成功；排水阻塞等待载荷，任务保持进行中）
         stub_request.set_json({"cid": cid, "text": "你好"})
         resp = await call("/astrbot_plugin_webui/send", "POST")
         gen_id = resp["data"].get("gen_id", "")
         check("E22 send 恒 200 {gen_id}", resp["status"] == 200 and len(gen_id) == 32)
-        await wait_for(lambda: len(chat_service._GENERATIONS.get(gen_id, {}).get("buffer", [])) > 0)
         stub_request.set_json({"cid": cid, "text": "第二条"})
         resp = await call("/astrbot_plugin_webui/send", "POST")
         check("E23 session_busy 409", resp["status"] == 409 and resp["data"]["error"] == "session_busy" and resp["data"]["code"] == 409)
 
-        # stop / stream
+        # stop（先落终态，不再取消消费任务）
         stub_request.set_json(None)
         resp = await call("/astrbot_plugin_webui/stop/<gen_id>", "POST", gen_id=gen_id)
         check("E24 stop -> ok/stopped", resp["status"] == 200 and resp["data"] == {"ok": True, "stopped": True})
-        await asyncio.wait([chat_service._GENERATIONS[gen_id]["task"]])
+        ok_stopped = await wait_for(lambda: any(e["event"] == "stopped" for e in chat_service._GENERATIONS.get(gen_id, {}).get("buffer", [])))
+        check("E24b stopped 终态已入缓冲", ok_stopped)
         resp = await call("/astrbot_plugin_webui/stop/<gen_id>", "POST", gen_id=gen_id)
         check("E25 已结束 stop 404", resp["status"] == 404)
 
         stream_resp = await call("/astrbot_plugin_webui/stream/<gen_id>", "GET", gen_id=gen_id)
         check("E26 stream 200 + event-stream", stream_resp["__type"] == "stream" and stream_resp["status"] == 200 and stream_resp["content_type"] == "text/event-stream", str(stream_resp))
 
-        # stream 内容重放（消费 SSE 生成器）
+        # stream 内容重放（消费 SSE 生成器；终态后关流）
         frames: list[str] = []
         async for frame in stream_resp["content"]:
             frames.append(frame)
@@ -1454,19 +1541,31 @@ def test_routes() -> None:
         resp = await call("/astrbot_plugin_webui/stream/<gen_id>", "GET", gen_id="missing")
         check("E27 未知 gen stream 404", resp["status"] == 404)
 
-        # delete（POST 别名）幂等 + 级联
+        # delete（POST 别名）幂等 + 级联（取消消费任务 + 宿主级联）
         stub_request.set_json(None)
         resp = await call("/astrbot_plugin_webui/conversations/<cid>/delete", "POST", cid=cid)
         check("E30 delete 别名 ok", resp["status"] == 200 and resp["data"] == {"ok": True})
         resp2 = await call("/astrbot_plugin_webui/conversations/<cid>/delete", "POST", cid=cid)
         check("E31 delete 幂等", resp2["status"] == 200)
-        check("E32 级联删权威会话", cid in plugin.context.conversation_manager.deleted)
-        check("E33 级联删富历史", not (plugin.data_dir() / "ui_history" / f"{cid}.json").exists())
+        check("E32 级联删宿主会话", umo_of(cid) in plugin.context.conversation_manager.deleted_by_user)
+        check("E33 级联删 platform_session", cid in plugin.context.db.deleted_sessions)
+        check("E34 DELETE 等价", (await call("/astrbot_plugin_webui/conversations/<cid>", "DELETE", cid=cid))["status"] == 200)
+        ok_task_done = await wait_for(lambda: chat_service._GENERATIONS.get(gen_id, {}).get("task") is None or chat_service._GENERATIONS[gen_id]["task"].done())
+        check("E35 消费任务已随删除取消", ok_task_done)
 
-        resp = await call("/astrbot_plugin_webui/conversations/<cid>", "DELETE", cid=cid)
-        check("E34 DELETE 等价", resp["status"] == 200 and resp["data"] == {"ok": True})
-
-        gate.set()
+        # 端到端：POST send -> 注入 -> 脚本化排水 -> done + bot 平台历史
+        stub_request.set_json({"persona_id": None})
+        resp = await call("/astrbot_plugin_webui/conversations", "POST")
+        cid2 = resp["data"]["cid"]
+        stub_request.set_json({"cid": cid2, "text": "端到端"})
+        resp = await call("/astrbot_plugin_webui/send", "POST")
+        gen2 = resp["data"]["gen_id"]
+        await feed_frames(gen2, _std_frames(gen2))
+        entry2 = chat_service._GENERATIONS[gen2]
+        check("E36 send→注入→排水→done 全链", await wait_for(lambda: entry2["task"].done() and any(e["event"] == "done" for e in entry2["buffer"]), timeout=10))
+        check("E37 done 后 active=None", chat_service.active_generation_id(cid2) is None)
+        check("E38 bot 平台历史落库", any(r.content.get("type") == "bot" for r in plugin.context.message_history_manager.rows))
+        check("E39 队列已清理", gen2 not in _stub_queue_mgr().back_queues)
 
     asyncio.run(_run())
 
@@ -1480,8 +1579,12 @@ async def _test_routes_attachments() -> None:
     print("== K. routes 附件端点与 send 附件链路 ==")
     chat_service._GENERATIONS.clear()
     sandbox = fresh_sandbox()
+    # 桩宿主数据路径注入沙盒（handle_upload 落点 = <stub data>/attachments/）
+    from astrbot.core.utils import astrbot_path as stub_astrbot_path
+
+    stub_astrbot_path.set_stub_data_path(sandbox / "hostdata")
     config = {"attachment_text_whitelist": ["txt", "md"], "upload_image_max_mb": 1, "upload_text_max_kb": 200}
-    plugin = make_plugin(sandbox, provider=None, config=config)
+    plugin = make_plugin(sandbox, config=config)
 
     register = routes.register_routes
     register(plugin)
@@ -1503,6 +1606,7 @@ async def _test_routes_attachments() -> None:
     resp = await call("/astrbot_plugin_webui/upload", "POST")
     check("K-2 upload 文本 200 元数据", resp["status"] == 200 and resp["data"]["kind"] == "text" and resp["data"]["file_id"].startswith("f_"), str(resp["data"]))
     fid_text = resp["data"]["file_id"]
+    check("K-2b 落盘 stub 宿主附件区", text_upload.saved_to is not None and text_upload.saved_to.parent == sandbox / "hostdata" / "attachments", str(text_upload.saved_to))
 
     # upload：图片（无 PIL 环境 preview 允许 None；真机为 data URL）
     png_upload = FakeUpload("b.png", "image/png", b"\x89PNG fake")
@@ -1510,6 +1614,7 @@ async def _test_routes_attachments() -> None:
     resp = await call("/astrbot_plugin_webui/upload", "POST")
     check("K-3 upload 图片元数据", resp["status"] == 200 and resp["data"]["kind"] == "image" and resp["data"]["mime"] == "image/png" and "truncated" not in resp["data"])
     fid_img = resp["data"]["file_id"]
+    check("K-3b db 注册取得 attachment_id", bool(plugin.context.db.attachments), str(plugin.context.db.attachments))
 
     # upload：白名单外 415 / 图片超限 413
     stub_request.set_files({"file": FakeUpload("x.exe", "application/x-msdownload", b"MZ")})
@@ -1526,47 +1631,66 @@ async def _test_routes_attachments() -> None:
     resp = await call("/astrbot_plugin_webui/files/<file_id>", "GET", file_id="f_missing")
     check("K-7 未知 file_id 404", resp["status"] == 404)
 
-    # send + file_ids 端到端
-    provider = FakeProvider([[_final("看完了", None, {"output": 2, "total": 3})]])
-    plugin.context.provider = provider
-    cid = (await conversation_service.create_conversation(plugin.context, "p1", None))["cid"]
+    # send + file_ids 端到端（v0.2 内核：附件按 attachment_id 注入，宿主管道消费）
+    stub_request.set_json({"persona_id": None})
+    resp = await call("/astrbot_plugin_webui/conversations", "POST")
+    cid = resp["data"]["cid"]
     stub_request.set_json({"cid": cid, "text": "看看这两个附件", "file_ids": [fid_text, fid_img]})
     resp = await call("/astrbot_plugin_webui/send", "POST")
     gen_id = resp["data"].get("gen_id", "")
     check("K-8 send 恒 200 {gen_id}", resp["status"] == 200 and len(gen_id) == 32)
-    await await_task(chat_service._GENERATIONS[gen_id]["task"])
 
-    check(
-        "K-9 图片路径直入 image_urls",
-        len(provider.calls[0]["image_urls"]) == 1
-        and provider.calls[0]["image_urls"][0].endswith(f"{fid_img}_b.png")
-        and str(sandbox) in provider.calls[0]["image_urls"][0],
-    )
-    check("K-10 文本附件拼区块", '<attachment name="a.md">' in provider.calls[0]["prompt"] and "看看这两个附件" in provider.calls[0]["prompt"])
+    # 注入 payload parts 校验（经桩队列捕获；等生成任务完成注入三步）
+    check("K-8b 注入落地", await wait_for(lambda: cid in _stub_queue_mgr().queues and bool(plugin.context.message_history_manager.rows), timeout=2))
+    queued = await asyncio.wait_for(_stub_queue_mgr().queues[cid].get(), timeout=2)
+    payload = queued[2]
+    types = [p["type"] for p in payload["message"]]
+    check("K-9 payload parts 含 plain+image+file", types[0] == "plain" and "image" in types and "file" in types, str(types))
+    full_img = await attachment_service.get_file(plugin.data_dir(), fid_img)
+    img_part = next(p for p in payload["message"] if p["type"] == "image")
+    check("K-10 image part 携带 attachment_id+path", img_part.get("attachment_id") == full_img["attachment_id"] and "path" in img_part, str(img_part))
 
-    doc = await uistore.load_conversation(sandbox, cid)
-    user_msg = doc["messages"][0]
-    check("K-11 user 消息 attachments 元数据同构", [a["file_id"] for a in user_msg["attachments"]] == [fid_text, fid_img] and user_msg["attachments"][1]["kind"] == "image")
-    bound_text = await attachment_service.get_file(sandbox, fid_text)
-    bound_img = await attachment_service.get_file(sandbox, fid_img)
-    check("K-12 索引引用绑定", bound_text["cid"] == cid and bound_img["cid"] == cid)
+    # 排水收尾（空 end：无 bot 行），断言任务收尾与队列纪律
+    await feed_frames(gen_id, [{"type": "end", "data": "", "streaming": False, "message_id": gen_id}])
+    entry = chat_service._GENERATIONS[gen_id]
+    check("K-11 排水收尾", await wait_for(lambda: entry["task"].done(), timeout=5))
+
+    # 用户平台历史：媒体 parts 落库（path 剥除）；索引引用绑定
+    user_rows = [r for r in plugin.context.message_history_manager.rows if r.content.get("type") == "user"]
+    media_parts = [p for p in user_rows[0].content["message"] if p["type"] in ("image", "file")]
+    check("K-12 用户媒体 parts 落库且剥 path", len(media_parts) == 2 and all("path" not in p and p.get("attachment_id") for p in media_parts), str(media_parts))
+    bound_text = await attachment_service.get_file(plugin.data_dir(), fid_text)
+    bound_img = await attachment_service.get_file(plugin.data_dir(), fid_img)
+    check("K-13 索引引用绑定 cid", bound_text["cid"] == cid and bound_img["cid"] == cid)
+
+    # history 端点：attachments 经索引反查（与用户消息 attachments 同构）
+    stub_request.set_query([("page", "1"), ("size", "30")])
+    resp = await call("/astrbot_plugin_webui/history/<cid>", "GET", cid=cid)
+    msgs = resp["data"]["messages"]
+    check("K-14 history user attachments 反查", [a["file_id"] for a in msgs[0].get("attachments") or []] == [fid_text, fid_img], str(msgs[0]))
 
     # send：未知 file_id 400；仅附件无文本 200
     stub_request.set_json({"cid": cid, "text": "", "file_ids": ["f_missing"]})
     resp = await call("/astrbot_plugin_webui/send", "POST")
-    check("K-13 未知 file_id 400", resp["status"] == 400)
+    check("K-15 未知 file_id 400", resp["status"] == 400)
     stub_request.set_json({"cid": cid, "text": "", "file_ids": [fid_text]})
     resp = await call("/astrbot_plugin_webui/send", "POST")
-    check("K-14 纯附件发送 200", resp["status"] == 200 and len(resp["data"]["gen_id"]) == 32)
-    await await_task(chat_service._GENERATIONS[resp["data"]["gen_id"]]["task"])
-    check("K-15 纯附件 prompt 为区块", provider.calls[1]["prompt"].startswith('<attachment name="a.md">'))
+    gen2 = resp["data"]["gen_id"]
+    check("K-16 纯附件发送 200", resp["status"] == 200 and len(gen2) == 32)
+    await feed_frames(gen2, [{"type": "end", "data": "", "streaming": False, "message_id": gen2}])
+    check("K-16b 纯附件任务收尾", await wait_for(lambda: chat_service._GENERATIONS[gen2]["task"].done(), timeout=5))
 
-    # 删除会话级联：附件文件 + 索引 + 富历史
+    # 删除会话级联：附件 db 行 + 磁盘 + 索引 + 平台历史 + 队列
+    db_count_before = len(plugin.context.db.attachments)
     stub_request.set_json(None)
     resp = await call("/astrbot_plugin_webui/conversations/<cid>/delete", "POST", cid=cid)
-    check("K-16 删除会话 ok", resp["status"] == 200 and resp["data"] == {"ok": True})
-    check("K-17 附件级联删除", await attachment_service.get_file(sandbox, fid_text) is None and await attachment_service.get_file(sandbox, fid_img) is None)
-    check("K-18 附件磁盘删除", not text_upload.saved_to.exists() and not png_upload.saved_to.exists())
+    check("K-17 删除会话 ok", resp["status"] == 200 and resp["data"] == {"ok": True})
+    check("K-18 附件索引级联删除", await attachment_service.get_file(plugin.data_dir(), fid_text) is None and await attachment_service.get_file(plugin.data_dir(), fid_img) is None)
+    check("K-19 附件磁盘删除", not text_upload.saved_to.exists() and not png_upload.saved_to.exists())
+    check("K-20 db 附件行级联删除", len(plugin.context.db.attachments) == db_count_before - 2, str(len(plugin.context.db.attachments)))
+    check("K-21 平台历史清空", plugin.context.message_history_manager.rows == [])
+    check("K-22 级联 offset_sec=99999999", any(d["offset_sec"] == 99999999 and d["user_id"] == cid for d in plugin.context.message_history_manager.deleted_offsets))
+    check("K-23 remove_queues", cid not in _stub_queue_mgr().queues)
 
 
 # ---------------------------------------------------------------------------
@@ -1604,7 +1728,7 @@ def check_docstrings() -> None:
     print("== G. docstring 契约 ==")
     modules = (
         routes, persona_service, conversation_service, chat_service,
-        attachment_service, tool_loop, uistore, sse, standalone,
+        attachment_service, pipeline_bridge, uistore, sse, standalone,
     )
     bad: list[str] = []
     for module in modules:
@@ -1627,21 +1751,15 @@ def main() -> int:
     asyncio.run(_test_chat_session_busy())
     asyncio.run(_test_chat_concurrency())
     asyncio.run(_test_chat_abort())
-    asyncio.run(_test_chat_provider_error())
-    asyncio.run(_test_chat_no_provider())
-    test_attachment_unit()
-    asyncio.run(_test_attachment_store())
-    asyncio.run(_test_orphan_sweep())
-    test_tool_loop_unit()
-    asyncio.run(_test_tool_set_filter())
-    asyncio.run(_test_chat_tool_loop())
-    asyncio.run(_test_chat_tool_loop_agent())
-    asyncio.run(_test_chat_tool_degrade())
-    asyncio.run(_test_chat_multimodal_error())
-    asyncio.run(_test_chat_text_attachment())
+    asyncio.run(_test_chat_idle_timeout())
+    asyncio.run(_test_chat_queue_discipline())
+    asyncio.run(_test_chat_media_frames())
     asyncio.run(_test_chat_concurrent_send())
     asyncio.run(_test_delete_while_generating())
     asyncio.run(_test_sse_ping())
+    test_attachment_unit()
+    asyncio.run(_test_attachment_store())
+    asyncio.run(_test_orphan_sweep())
     asyncio.run(_test_standalone_logic())
     test_routes()
     asyncio.run(_test_routes_attachments())

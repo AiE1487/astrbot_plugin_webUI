@@ -150,6 +150,9 @@ export function createSidebar({ root, store, t, version }) {
     }
     convoList.replaceChildren(...conversations.map((convo, index) => {
       const busy = Boolean(convo.busy) || Boolean(store.streamForCid(convo.cid));
+      // v1.1 可选字段 legacy:true = 旧版归档（只读），列表项加「旧版」徽标；
+      // 删除按钮保持可用（后端支持删除归档）
+      const legacy = Boolean(convo.legacy);
       const deleteBtn = el("button", {
         class: "ci-del",
         type: "button",
@@ -170,6 +173,7 @@ export function createSidebar({ root, store, t, version }) {
         el("span", { class: "ci-main" },
           el("span", { class: "ci-title", text: convo.title || t("convo.untitled", "新会话") }),
           el("span", { class: "ci-meta" },
+            legacy ? el("span", { class: "badge is-legacy", text: t("convo.legacyBadge", "旧版") }) : null,
             el("span", { class: "ci-persona", text: store.personaOf(convo.persona_id)?.name ?? convo.persona_id ?? "" }),
             el("span", { text: shortDate(convo.updated_at) }),
             busy ? el("span", { class: "ci-busy" }, el("span", { class: "busy-dot" }), t("convo.busy", "生成中")) : null,

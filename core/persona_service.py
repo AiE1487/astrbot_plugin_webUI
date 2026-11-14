@@ -1,4 +1,4 @@
-"""人格服务：人格列表与工具白名单解析（数据源 ``context.persona_manager``）。
+"""人格服务：人格列表（数据源 ``context.persona_manager``）。
 
 宿主 API 实证（AstrBot v4.29.4 persona_mgr.py / po.py）：
 - ``get_all_personas()`` 返回 **Persona PO 列表**（属性 ``persona_id`` /
@@ -10,7 +10,8 @@
 因此两种对象的访问方式不同：Persona PO 用属性、Personality 用 ``["name"]`` 下标，
 勿混写。契约 id/name 均取 ``persona_id``。
 
-人格 ``tools`` 语义（拍板）：``None`` = 全部工具、``[]`` = 禁用、列表 = 白名单。
+v0.2 起：会话人格解析/工具注入全部归还宿主管道（persona_service 仅供
+GET personas 列表展示；旧 resolve_persona_tools 已随工具循环废止）。
 """
 
 from astrbot.api.star import Context
@@ -95,24 +96,6 @@ async def list_personas(context: Context, umo: str | None = None) -> list[dict]:
             }
         )
     return items
-
-
-def resolve_persona_tools(persona_tools: list[str] | None) -> tuple[bool, set[str] | None]:
-    """解析人格 ``tools`` 字段语义（§3.3 工具循环的 ToolSet 过滤依据）。
-
-    Args:
-        persona_tools: 人格的 tools 字段。``None`` = 全部工具；``[]`` = 禁用；
-            非空列表 = 白名单。
-
-    Returns:
-        ``(allow_tools, whitelist)``：``allow_tools=False`` 表示该人格禁用全部
-        工具；``whitelist=None`` 表示不限（全部工具），否则为白名单集合。
-    """
-    if persona_tools is None:
-        return True, None
-    if not persona_tools:  # 空列表：禁用全部工具
-        return False, set()
-    return True, {str(t) for t in persona_tools}
 
 
 def summarize_system_prompt(system_prompt: str, max_len: int = 120) -> str:

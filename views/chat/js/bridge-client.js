@@ -30,7 +30,7 @@ import { createMockTransport } from "./mock.js";
 
 /** 与 metadata.yaml version 保持一致（加载屏/侧栏脚注显示用）。 */
 export const PLUGIN_NAME = "astrbot_plugin_webui";
-export const PLUGIN_VERSION = "0.1.1";
+export const PLUGIN_VERSION = "0.2.0";
 
 const CHANNEL = "astrbot-plugin-page";
 const READY_TIMEOUT = 4000;
@@ -125,6 +125,7 @@ const TRANSLATIONS = {
     "convo.untitled": "新会话",
     "convo.delete": "删除会话",
     "convo.busy": "生成中",
+    "convo.legacyBadge": "旧版",
     "dialog.deleteTitle": "删除会话",
     "dialog.deleteBody": "将删除「{title}」的权威历史、富历史与全部附件，且不可恢复。\n确认删除？",
     "dialog.cancel": "取消",
@@ -164,6 +165,7 @@ const TRANSLATIONS = {
     "composer.uploadProgress": "上传中 {pct}%",
     "composer.dropHint": "松开以添加附件",
     "composer.sending": "发送中…",
+    "composer.legacyNotice": "旧版会话为只读归档，无法继续对话",
     "error.sessionBusy": "该会话正在生成回复，请等待完成或先停止",
     "error.concurrencyLimit": "全局并发已达上限，请稍后再试",
     "error.payloadTooLarge": "文件超过上传大小上限",
@@ -212,6 +214,7 @@ const TRANSLATIONS = {
     "convo.untitled": "New chat",
     "convo.delete": "Delete conversation",
     "convo.busy": "busy",
+    "convo.legacyBadge": "Legacy",
     "dialog.deleteTitle": "Delete conversation",
     "dialog.deleteBody": 'This permanently deletes "{title}" with its history and all attachments.\nContinue?',
     "dialog.cancel": "Cancel",
@@ -251,6 +254,7 @@ const TRANSLATIONS = {
     "composer.uploadProgress": "Uploading {pct}%",
     "composer.dropHint": "Drop to add attachments",
     "composer.sending": "Sending…",
+    "composer.legacyNotice": "Legacy conversations are read-only archives.",
     "error.sessionBusy": "This conversation is already generating. Wait for it to finish or stop it first.",
     "error.concurrencyLimit": "Global concurrency limit reached. Try again later.",
     "error.payloadTooLarge": "File exceeds the upload size limit",

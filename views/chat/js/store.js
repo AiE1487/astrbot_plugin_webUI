@@ -605,6 +605,11 @@ export function createStore({ api, transport, t }) {
       if (!personaId) throw new Error("no persona available");
       cid = await createConversation(personaId);
     }
+    // v1.1 可选字段 legacy:true：旧版归档只读。composer 已禁发（canSend 短路），
+    // 这里兜底拦截绕过 UI 的直调路径；deleteConversation 不受限。
+    if (conversationOf(cid)?.legacy) {
+      throw new Error(t("composer.legacyNotice", "旧版会话为只读归档，无法继续对话"));
+    }
     const fileIds = attachments.map((meta) => String(meta.file_id));
     const userMessage = normalizeMessage({
       id: localId(),

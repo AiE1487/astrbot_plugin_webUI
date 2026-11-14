@@ -247,16 +247,18 @@ async def _handle_api(request, plugin: Star, aio_web) -> "aio_web.Response":  # 
 
     endpoint = request.match_info["endpoint"]
 
+    # 鉴权先行（/api/login 走独立路由不受影响）：upload 在内的一切 /api/* 端点
+    # 必须先验 token 再分发，杜绝未鉴权端点绕过独立端口鉴权
+    if not _verify_token(_extract_token(request)):
+        return aio_web.json_response(
+            _error_body(401, "unauthorized", "未登录或令牌无效"), status=401
+        )
+
     # upload 特例：aiohttp multipart 独立实现（不经 astrbot.api.web.request.files 代理）
     if endpoint == "upload":
         if request.method != "POST":
             return aio_web.json_response(_error_body(404, "not_found", "不支持的请求方法"), status=404)
         return await _handle_upload(request, plugin, aio_web)
-
-    if not _verify_token(_extract_token(request)):
-        return aio_web.json_response(
-            _error_body(401, "unauthorized", "未登录或令牌无效"), status=401
-        )
 
     for method, pattern, handler_name in _API_ROUTES:
         if request.method != method:
@@ -299,7 +301,9 @@ async def _handle_upload(request, plugin: Star, aio_web) -> "aio_web.Response": 
             status=400,
         )
     try:
-        meta = await attachment_service.store_upload(upload, plugin.data_dir(), plugin.config)
+        meta = await attachment_service.store_upload(
+            upload, plugin.context, plugin.config, plugin.data_dir()
+        )
     except attachment_service.InvalidFilenameError as exc:
         return aio_web.json_response(_error_body(400, "invalid_request", str(exc)), status=400)
     except attachment_service.UnsupportedMediaTypeError as exc:

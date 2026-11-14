@@ -1,17 +1,18 @@
-"""UI 富历史存储：``data/plugin_data/astrbot_plugin_webui/ui_history/<cid>.json``（历史双写的另一半）。
+"""UI 富历史存储：``data/plugin_data/astrbot_plugin_webui/ui_history/<cid>.json``（v0.2 降级为只读归档层）。
 
-契约（UserPlan §3.1 + 对接契约 §富历史；M2 工单刻意细化）：
-- **每个会话一个 JSON 文件**（对计划 §3.1 单文件 ``ui_history.json`` 示意图的
-  刻意细化）：不同会话的写互不竞争，无需跨 cid 写锁；读侧依靠 ``tmp 写 +
-  os.replace`` 原子替换保证只读到完整文件。计划示意图与实现的差异在此注明；
-- 富历史含工具调用步骤、reasoning、附件引用与消息元数据；刷新/重载后 UI 从
-  富历史渲染，LLM 上下文从 conversation_manager 权威历史组装（§3.1 双写）；
+契约（开发计划 §0.3 处置清单）：
+- **v0.2 起新会话历史全量托管给宿主平台历史**（platform_message_history），
+  本模块**不再写入**：只保留读/分页/删除归档文件能力，作为 v0.1.x 旧会话的
+  只读归档（可查看不可续聊，不迁移）；
+- ``conversations`` 列表与 ``history/<cid>`` 的 legacy 分支数据源即本模块
+  （``list_archives`` / ``page_messages``）；legacy 删除走 ``clear_conversation``
+  （删归档文件、不触宿主）；
 - 文档带 ``version`` 字段留迁移（当前 1）；加载不识别的版本时尽力读取
   ``messages`` 并记 warning，**不清空用户数据**；
 - **持久化绝不写插件目录**（插件更新/重装会丢）——路径由调用方传入插件数据目录
   （``data/plugin_data/astrbot_plugin_webui/``，main.py 经 get_astrbot_data_path 计算）。
 
-文件结构::
+文件结构（v0.1.x 遗留，只读）::
 
     {"version": 1, "cid": "<cid>", "updated_at": "<ISO8601>",
      "messages": [<对接契约 §富历史的消息对象>...]}
@@ -45,19 +46,6 @@ def _retry_file_io(func, attempts: int = 4, delay: float = 0.02):
             time.sleep(delay)
 
 
-# per-cid 写锁（读-改-写串行化；asyncio.Lock 在 3.10+ 惰性绑定事件循环，
-# 模块级复用安全；跨 cid 不同键天然无竞争）
-_CID_LOCKS: dict[str, asyncio.Lock] = {}
-
-
-def _lock_for(cid: str) -> asyncio.Lock:
-    lock = _CID_LOCKS.get(cid)
-    if lock is None:
-        lock = asyncio.Lock()
-        _CID_LOCKS[cid] = lock
-    return lock
-
-
 def now_iso() -> str:
     """当前时刻的 ISO8601 带时区字符串（UTC）。"""
     return datetime.now(timezone.utc).isoformat()
@@ -69,32 +57,22 @@ def new_message_id() -> str:
 
 
 def ui_store_path(data_dir: Path) -> Path:
-    """返回富历史存储目录：``<data_dir>/ui_history/``。
-
-    M2 细化：M1 示意图是单文件 ``<data_dir>/ui_history.json``；实现改为每
-    cid 一文件避免跨会话写锁，本函数返回的是目录，单会话文件见
-    ``conversation_file``。
-    """
+    """返回富历史存储目录：``<data_dir>/ui_history/``。"""
     return Path(data_dir) / HISTORY_DIR_NAME
 
 
 def conversation_file(data_dir: Path, cid: str) -> Path:
-    """返回某会话的富历史文件路径：``<data_dir>/ui_history/<cid>.json``。
+    """返回某会话的归档文件路径：``<data_dir>/ui_history/<cid>.json``。
 
-    cid 由路由层保证为 uuid4hex（构造时由宿主生成），直接拼接不会引入路径
-    分隔符；此处仍做一次防御性校验。
+    cid 由路由层保证为 uuid4hex；此处仍做一次防御性校验。
     """
     if not cid or "/" in cid or "\\" in cid or cid in (".", ".."):
         raise ValueError(f"非法会话 id: {cid!r}")
     return ui_store_path(data_dir) / f"{cid}.json"
 
 
-def _empty_doc(cid: str) -> dict:
-    return {"version": SCHEMA_VERSION, "cid": cid, "updated_at": now_iso(), "messages": []}
-
-
 def _read_doc(path: Path) -> dict | None:
-    """同步读单个会话文档；不存在/损坏返回 None（调用方决定兜底行为）。"""
+    """同步读单个归档文档；不存在/损坏返回 None（调用方决定兜底行为）。"""
     try:
         raw = _retry_file_io(lambda: path.read_text(encoding="utf-8"))
     except FileNotFoundError:
@@ -102,57 +80,42 @@ def _read_doc(path: Path) -> dict | None:
     except OSError as exc:
         from astrbot.api import logger
 
-        logger.warning(f"[uistore] 读取富历史失败 {path}: {exc}")
+        logger.warning(f"[uistore] 读取归档失败 {path}: {exc}")
         return None
     try:
         doc = json.loads(raw)
     except json.JSONDecodeError as exc:
         from astrbot.api import logger
 
-        logger.warning(f"[uistore] 富历史 JSON 损坏（保留原文件不清空）{path}: {exc}")
+        logger.warning(f"[uistore] 归档 JSON 损坏（保留原文件不清空）{path}: {exc}")
         return None
     if not isinstance(doc, dict) or not isinstance(doc.get("messages"), list):
         from astrbot.api import logger
 
-        logger.warning(f"[uistore] 富历史结构不符（保留原文件不清空）{path}")
+        logger.warning(f"[uistore] 归档结构不符（保留原文件不清空）{path}")
         return None
     version = doc.get("version")
     if version != SCHEMA_VERSION:
         from astrbot.api import logger
 
         logger.warning(
-            f"[uistore] 富历史版本 {version!r} 与当前 {SCHEMA_VERSION} 不同，"
+            f"[uistore] 归档版本 {version!r} 与当前 {SCHEMA_VERSION} 不同，"
             f"尽力读取 messages（迁移预留）{path}"
         )
     return doc
 
 
-def _write_doc(path: Path, doc: dict) -> None:
-    """同步原子写：先写同目录临时文件，再 ``os.replace`` 原子替换。"""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    try:
-        _retry_file_io(
-            lambda: tmp.write_text(
-                json.dumps(doc, ensure_ascii=False, indent=1), encoding="utf-8"
-            )
-        )
-        _retry_file_io(lambda: os.replace(tmp, path))
-    finally:
-        if tmp.exists():  # replace 失败时清理临时文件
-            tmp.unlink(missing_ok=True)
-
-
 async def load_conversation(data_dir: Path, cid: str) -> dict:
-    """读取某会话的富历史文档；不存在或损坏返回空结构（不抛错、不清盘）。"""
-    doc = await asyncio.to_thread(_read_doc, conversation_file(data_dir, cid))
+    """读取某会话归档文档；不存在或损坏返回空结构（不抛错、不清盘）。"""
+    path = conversation_file(data_dir, cid)
+    doc = await asyncio.to_thread(_read_doc, path)
     if doc is None:
-        return _empty_doc(cid)
+        return {"version": SCHEMA_VERSION, "cid": cid, "updated_at": now_iso(), "messages": []}
     return doc
 
 
 async def load_ui_history(data_dir: Path) -> dict:
-    """读取全部富历史（扫描 ui_history 目录下所有 ``<cid>.json``）。
+    """读取全部归档（扫描 ui_history 目录下所有 ``<cid>.json``）。
 
     Returns:
         ``{version, conversations: {cid: {version, cid, updated_at, messages}}}``；
@@ -174,42 +137,42 @@ async def load_ui_history(data_dir: Path) -> dict:
     return {"version": SCHEMA_VERSION, "conversations": conversations}
 
 
-async def append_message(data_dir: Path, cid: str, message: dict) -> dict:
-    """追加一条 UI 消息（读-改-原子写；message 即对接契约 §富历史的消息对象）。
-
-    同 cid 的读-改-写全程持 per-cid 锁（``_lock_for``）：并发追加（如 single-flight
-    窗口外的边界场景）串行化，杜绝后写覆盖前写丢消息；跨 cid 天然无竞争。
+async def list_archives(data_dir: Path) -> list[dict]:
+    """扫描归档目录产出 legacy 会话项（conversations 列表 legacy 追加项数据源）。
 
     Returns:
-        追加后的完整消息（补全 id/ts 缺省值；ts 缺省当前 ISO8601 UTC）。
+        ``[{cid, updated_at, first_user_text}]``（updated_at 为文档 ISO 时间；
+        first_user_text 取首条用户消息文本，供标题派生；空目录返回 []）。
     """
-    path = conversation_file(data_dir, cid)
-    stored = dict(message)
-    stored.setdefault("id", new_message_id())
-    stored.setdefault("ts", now_iso())
+    root = ui_store_path(data_dir)
 
-    def _update() -> dict:
-        doc = _read_doc(path) or _empty_doc(cid)
-        doc["version"] = SCHEMA_VERSION
-        doc["cid"] = cid
-        doc["messages"] = list(doc.get("messages") or [])
-        doc["messages"].append(stored)
-        doc["updated_at"] = now_iso()
-        _write_doc(path, doc)
-        return stored
+    def _scan() -> list[dict]:
+        items: list[dict] = []
+        if not root.is_dir():
+            return items
+        for path in sorted(root.glob("*.json")):
+            doc = _read_doc(path)
+            if doc is None or not doc.get("cid"):
+                continue
+            first_user_text = ""
+            for message in doc.get("messages") or []:
+                if isinstance(message, dict) and message.get("role") == "user":
+                    first_user_text = str(message.get("text") or "")
+                    break
+            items.append(
+                {
+                    "cid": str(doc["cid"]),
+                    "updated_at": doc.get("updated_at") or "",
+                    "first_user_text": first_user_text,
+                }
+            )
+        return items
 
-    async with _lock_for(cid):
-        return await asyncio.to_thread(_update)
-
-
-async def has_user_message(data_dir: Path, cid: str) -> bool:
-    """该会话是否已存在用户消息（「首条用户消息后自动改题」判定用）。"""
-    doc = await load_conversation(data_dir, cid)
-    return any(msg.get("role") == "user" for msg in doc.get("messages") or [])
+    return await asyncio.to_thread(_scan)
 
 
 async def page_messages(data_dir: Path, cid: str, page: int = 1, size: int = 30) -> dict:
-    """分页读取某会话富历史（GET history/<cid> 数据源）。
+    """分页读取某会话归档（GET history/<cid> legacy 分支数据源）。
 
     分页语义（对接契约 §REST）：page=1 为**最新一页**，页内消息旧 -> 新；
     ``has_more`` 表示更早的数据还有。
@@ -236,11 +199,7 @@ async def page_messages(data_dir: Path, cid: str, page: int = 1, size: int = 30)
 
 
 async def clear_conversation(data_dir: Path, cid: str) -> None:
-    """删除会话时清理其富历史文件（与 conversation_service.delete_conversation 配套）。
-
-    与 ``append_message`` 共用 per-cid 锁：删除与追加串行化，杜绝「先删后追加」
-    造成的已删会话文件复活。
-    """
+    """删除归档文件（legacy 会话删除分支；与读侧共用文件路径校验）。"""
     path = conversation_file(data_dir, cid)
 
     def _unlink() -> None:
@@ -249,7 +208,6 @@ async def clear_conversation(data_dir: Path, cid: str) -> None:
         except OSError as exc:
             from astrbot.api import logger
 
-            logger.warning(f"[uistore] 删除富历史失败 {path}: {exc}")
+            logger.warning(f"[uistore] 删除归档失败 {path}: {exc}")
 
-    async with _lock_for(cid):
-        await asyncio.to_thread(_unlink)
+    await asyncio.to_thread(_unlink)

@@ -167,6 +167,13 @@
   background: var(--accent-soft);
 }
 
+/* 旧版归档会话徽标（legacy:true，只读） */
+.badge.is-legacy {
+  color: var(--warning);
+  border-color: rgba(245, 166, 35, 0.4);
+  background: rgba(245, 166, 35, 0.08);
+}
+
 .persona-block .pb-hint {
   margin-top: 6px;
   font-size: 11px;

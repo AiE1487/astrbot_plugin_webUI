@@ -7,13 +7,13 @@
 
     GET    health                    连通性探测
     GET    personas                  人格列表（id、名称、system_prompt 摘要、工具、默认）
-    GET    conversations             会话列表（cid、title、persona_id、updated_at、busy）
+    GET    conversations             会话列表（cid、title、persona_id、updated_at、busy、legacy?）
     POST   conversations             新建 {persona_id, title?} -> {cid}
-    DELETE conversations/<cid>       删除会话（权威历史 + 富历史 + 附件级联清理）
+    DELETE conversations/<cid>       删除会话（宿主级联 / legacy 归档分支）
     POST   conversations/<cid>/delete  同上（bridge SDK 无 DELETE 方法的等价别名）
-    GET    history/<cid>             UI 富历史分页 ?page=&size=（page=1 最新一页）
+    GET    history/<cid>             历史分页 ?page=&size=（page=1 最新一页；legacy 响应附 legacy:true）
     POST   send                      {cid, text, file_ids[]} -> {gen_id}；409 见契约
-    POST   stop/<gen_id>             中止生成（先落终态 stopped 再 task.cancel()）
+    POST   stop/<gen_id>             中止生成（先落终态 stopped 再优雅中止）
     GET    stream/<gen_id>           SSE（bridge.subscribeSSE；seq=0 全量重放 -> 实时）
     POST   upload                    multipart 单文件 -> 附件元数据；413/415 见契约
     GET    files/<file_id>           原文件（file_response，经索引定位）
@@ -139,11 +139,6 @@ def _query_int(query, key: str, default: int) -> int:
         return default
 
 
-def _read_int_config(config: dict, key: str) -> int:
-    """实时读配置 int（键由 _conf_schema.json 生成恒存在；默认值单一来源 = schema）。"""
-    return max(1, int(config[key]))
-
-
 async def _plugin_version(plugin: Star) -> str:
     """插件版本：优先宿主 StarMetadata，兜底读插件目录 metadata.yaml（IO 走线程）。"""
     try:
@@ -225,9 +220,11 @@ async def handle_personas(plugin: Star):
 
 @_endpoint
 async def handle_list_conversations(plugin: Star):
-    """GET conversations —— 会话列表（updated_at 降序，busy=该 cid 有进行中任务）。"""
-    items = await conversation_service.list_conversations(plugin.context)
+    """GET conversations —— 会话列表（updated_at 降序；宿主项并入 busy，legacy 项恒 false）。"""
+    items = await conversation_service.list_conversations(plugin.context, plugin.data_dir())
     for item in items:
+        if item.get("legacy"):
+            continue  # legacy 归档只读，不存在进行中生成
         item["busy"] = chat_service.active_generation_id(item["cid"]) is not None
     return json_response({"conversations": items})
 
@@ -253,27 +250,29 @@ async def handle_create_conversation(plugin: Star):
 async def handle_delete_conversation(plugin: Star, cid: str):
     """DELETE conversations/<cid> 与 POST .../delete —— 幂等删除 + 级联清理。
 
-    若该会话有进行中生成任务，先中止再删（避免删后任务又写回富历史）。
+    若该会话有进行中生成任务，先落终态并取消消费任务再删（避免删后排水任务
+    又向平台历史写回数据）；宿主级联（request_agent_stop_all + 平台历史/
+    conversation/platform_session/队列/附件清理）在 conversation_service 内。
+    legacy 归档会话只删 uistore 归档文件与插件附件索引，不触宿主。
     """
-    gen_id = chat_service.active_generation_id(cid)
-    if gen_id is not None:
-        # wait=True：等被取消任务完全收尾（CancelledError 分支的历史写入完成）后再删，
-        # 否则删除先执行、中止分支随后写回富历史，复活已删除会话的数据。
-        await chat_service.abort_generation(gen_id, wait=True)
+    await chat_service.cancel_generation_tasks(cid, wait=True)
     await conversation_service.delete_conversation(plugin.context, cid, plugin.data_dir())
     return json_response({"ok": True})
 
 
 @_endpoint
 async def handle_history(plugin: Star, cid: str):
-    """GET history/<cid>?page=&size= —— 富历史分页（page=1 最新一页，页内旧->新）。"""
-    conv = await conversation_service.get_conversation(plugin.context, cid)
-    if conv is None:
-        raise chat_service.SendRejected(404, "not_found", f"会话不存在: {cid}")
+    """GET history/<cid>?page=&size= —— 历史分页（page=1 最新一页，页内旧->新）。
+
+    新建会话读宿主平台历史（映射富历史 schema）；无宿主会话且有 v0.1.x 归档
+    文件时读归档，响应与消息附 ``legacy: true``；两者皆无 -> 404。
+    """
     page = max(1, _query_int(request.query, "page", 1))
     size = _query_int(request.query, "size", HISTORY_DEFAULT_PAGE_SIZE)
     size = min(max(1, size), HISTORY_MAX_PAGE_SIZE)
-    result = await uistore.page_messages(plugin.data_dir(), cid, page, size)
+    result = await conversation_service.page_history(
+        plugin.context, plugin.data_dir(), cid, page, size
+    )
     return json_response(result)
 
 
@@ -282,9 +281,8 @@ async def handle_send(plugin: Star):
     """POST send —— body {cid, text, file_ids[]} -> {gen_id}（恒 200；校验失败 4xx）。
 
     409 两种：同会话生成中 session_busy / 全局并发满 concurrency_limit；
-    会话不存在 404；未知/非法 file_ids -> 400。图片经索引取本地路径直入
-    image_urls（多模态不支持不在 send 同步判定，生成期捕获后经 SSE
-    error{code:model_not_multimodal} 呈现）；文本附件读出内容拼附件区块。
+    会话不存在 404；未知/非法 file_ids -> 400。附件按索引解析为媒体 parts
+    （attachment_id 交宿主管道解析，v0.2 起文本附件同样作为 file part）。
     """
     body = await _json_body()
     cid = body.get("cid")
@@ -304,8 +302,7 @@ async def handle_send(plugin: Star):
         )
 
     metas: list[dict] = []
-    image_urls: list[str] = []
-    attachment_blocks: list[str] = []
+    media_parts: list[dict] = []
     resolved_ids: list[str] = []
     for file_id in file_ids:
         if not isinstance(file_id, str) or not file_id.startswith("f_"):
@@ -313,26 +310,31 @@ async def handle_send(plugin: Star):
         meta = await attachment_service.get_file(plugin.data_dir(), file_id)
         if meta is None:
             raise chat_service.SendRejected(400, "invalid_request", f"附件不存在: {file_id}")
-        disk_path = plugin.data_dir() / str(meta.get("path", ""))
+        attachment_id = str(meta.get("attachment_id") or "")
+        if not attachment_id:
+            raise chat_service.SendRejected(
+                400, "invalid_request", "附件未注册宿主 attachment_id（旧版附件不可发送）"
+            )
+        disk_path = attachment_service.resolve_disk_path(plugin.data_dir(), meta)
         if not disk_path.is_file():
             raise chat_service.SendRejected(400, "invalid_request", f"附件文件已丢失: {file_id}")
         metas.append(attachment_service.public_meta(meta))
-        if meta["kind"] == "image":
-            image_urls.append(str(disk_path))  # 本地路径直入 image_urls（生成期才判多模态）
-        else:
-            content, _truncated = await asyncio.to_thread(
-                attachment_service.extract_text_content,
-                disk_path,
-                _read_int_config(plugin.config, "upload_text_max_kb"),
-            )
-            attachment_blocks.append(attachment_service.build_attachment_block(meta["name"], content))
+        media_parts.append(
+            {
+                # v0.2：媒体 parts 携带 attachment_id 交宿主 build_webchat_message_parts
+                # 解析；path 供适配器定位文件（落库前由 bridge 剥除）
+                "type": "image" if meta["kind"] == "image" else "file",
+                "attachment_id": attachment_id,
+                "filename": str(meta.get("name") or disk_path.name),
+                "path": str(disk_path),
+            }
+        )
         resolved_ids.append(file_id)
 
     gen_id = await chat_service.start_generation(
         plugin, cid.strip(), text,
-        image_urls=image_urls or None,
-        attachment_blocks=attachment_blocks or None,
-        attachment_meta=metas or None,
+        media_parts=media_parts,
+        attachment_metas=metas or None,
     )
     for file_id in resolved_ids:  # 引用绑定（失败不阻断：孤儿清理只清未引用附件）
         try:
@@ -348,14 +350,18 @@ async def handle_upload(plugin: Star):
 
     类型不在白名单 415 unsupported_media_type；图片超限（upload.save(max_bytes)
     抛 UploadTooLargeError）413 payload_too_large 拒绝不截断；文本落盘套 16MB
-    硬上限，注入内容超 upload_text_max_kb 截断置 truncated=true。
+    硬上限、preview 超前 500 字符截断置 truncated=true；落点 = 宿主附件区
+    ``data/attachments/``，保存后经 ``db.insert_attachment`` 注册取得
+    attachment_id（等同官方 WebChat 行为）。
     """
     files = await request.files()
     upload = files.get("file") if files else None
     if not isinstance(upload, PluginUploadFile):
         raise chat_service.SendRejected(400, "invalid_request", "没有拿到文件（multipart 字段名须为 file）")
     try:
-        meta = await attachment_service.store_upload(upload, plugin.data_dir(), plugin.config)
+        meta = await attachment_service.store_upload(
+            upload, plugin.context, plugin.config, plugin.data_dir()
+        )
     except attachment_service.InvalidFilenameError as exc:
         raise chat_service.SendRejected(400, "invalid_request", str(exc))
     except attachment_service.UnsupportedMediaTypeError as exc:
@@ -379,7 +385,7 @@ async def handle_files(plugin: Star, file_id: str):
 
 @_endpoint
 async def handle_stop(plugin: Star, gen_id: str):
-    """POST stop/<gen_id> —— 先落终态 stopped 再 cancel；未知/已结束 404。"""
+    """POST stop/<gen_id> —— 先落终态 stopped 再 request_agent_stop_all(umo) 优雅中止；消费任务不 cancel，等 end 帧自然收尾；未知/已结束 404。"""
     stopped = await chat_service.abort_generation(gen_id)
     if not stopped:
         raise chat_service.SendRejected(404, "not_found", f"生成任务不存在或已结束: {gen_id}")
