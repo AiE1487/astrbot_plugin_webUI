@@ -195,9 +195,7 @@ v0.1.x 创建的旧会话更新后自动变为**只读归档**（会话列表带
 - UI 预览：`views/chat/index.html?mock=1` 普通浏览器直开即可，mock 数据驱动
   整套 UI（含流式/工具/409/413 分支演示）；
 - stub 自测：`.venv/bin/python.exe tests/selftest.py`（stub 宿主下验证 core/
-  全链路，当前 249 项断言）；
-- 仿真宿主：`UserPlan/debug/hostmock/server.mjs`（仓库外的开发工作区工具）按
-  v4.29.4 真实宿主行为托管视图，`node server.mjs 8787` 后访问 `/host`；
+  全链路，当前 314 项断言）；
 - 打包校验：astrbot-plugin-dev skill 的 `scripts/package_plugin.py
   <插件目录> --check`（0 ERROR 后打包；zip 顶层目录 = 插件名）。
 

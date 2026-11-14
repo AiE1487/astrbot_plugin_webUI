@@ -7,3 +7,7 @@ dist/
 
 # 本机环境
 .venv/
+
+# 参考源码与本地工具（不跟踪；打包脚本不读 .gitignore，打包前需临时移出 .astrbot-src/）
+.astrbot-src/
+.zcode/

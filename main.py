@@ -27,7 +27,7 @@ from .core.standalone import start as standalone_start, stop as standalone_stop
 class WebUIPlugin(Star):
     """酒馆风对话 WebUI：Dashboard 内嵌视图 + 独立端口页双入口的单用户共享会话池。
 
-    功能范围（UserPlan §1 F1-F9）：人格选择、流式回复、思考与工具调用展示、
+    功能范围：人格选择、流式回复、思考与工具调用展示、
     附件对话、会话管理；UI 内不提供模型参数调节入口。
     """
 
