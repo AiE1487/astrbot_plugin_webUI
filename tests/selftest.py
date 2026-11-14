@@ -575,6 +575,47 @@ async def _test_uistore() -> None:
     await uistore.clear_conversation(sandbox, cid)
     check("B15 clear 删除归档文件", not path.exists())
 
+    # ── v0.3.1 UI 设置与头像持久化 ──
+    import base64 as _base64
+
+    check("B16 设置缺省为空", await uistore.load_ui_settings(sandbox) == {})
+    saved = await uistore.save_ui_settings(sandbox, {"compact": True, "flowWidth": "wide"})
+    check("B17 save 返回快照", saved == {"compact": True, "flowWidth": "wide"})
+    check("B18 load 往返", await uistore.load_ui_settings(sandbox) == {"compact": True, "flowWidth": "wide"})
+    check("B19 设置文件名", uistore.ui_settings_file(sandbox).name == "ui_settings.json" and uistore.ui_settings_file(sandbox).is_file())
+    check(
+        "B20 头像文件名映射",
+        uistore.avatar_file(sandbox, "avatarUser").name == "User_head.png"
+        and uistore.avatar_file(sandbox, "avatarAssistant").name == "LLM_head.png",
+    )
+    try:
+        uistore.avatar_file(sandbox, "evil/../x")
+        check("B21 非法头像键拒绝", False)
+    except ValueError:
+        check("B21 非法头像键拒绝", True)
+    check("B22 缺头像读为空", await uistore.read_avatar_data_url(sandbox, "avatarUser") == "")
+
+    png_bytes = bytes.fromhex("89504e470d0a1a0a")  # PNG 魔数前 8 字节
+    data_url = "data:image/png;base64," + _base64.b64encode(png_bytes).decode("ascii")
+    await uistore.write_avatar_data_url(sandbox, "avatarUser", data_url)
+    check("B23 头像落盘 User_head.png", uistore.avatar_file(sandbox, "avatarUser").is_file())
+    check("B24 头像读回 data URL 一致", await uistore.read_avatar_data_url(sandbox, "avatarUser") == data_url)
+    await uistore.write_avatar_data_url(sandbox, "avatarUser", data_url)
+    check("B25 同内容幂等写（无 tmp 残留）", list(sandbox.glob("*.tmp")) == [], str(list(sandbox.glob('*.tmp'))))
+    new_url = "data:image/png;base64," + _base64.b64encode(png_bytes + b"v2").decode("ascii")
+    await uistore.write_avatar_data_url(sandbox, "avatarUser", new_url)
+    check("B26 新头像覆盖旧文件", await uistore.read_avatar_data_url(sandbox, "avatarUser") == new_url)
+    for bad in ["data:image/jpeg;base64,AAAA", "data:image/png;base64,!!!", "data:image/png;base64,", "hello"]:
+        try:
+            await uistore.write_avatar_data_url(sandbox, "avatarAssistant", bad)
+            check(f"B27 非法 data URL 拒绝（{bad[:26]}…）", False)
+        except ValueError:
+            check(f"B27 非法 data URL 拒绝（{bad[:26]}…）", True)
+    await uistore.clear_avatar(sandbox, "avatarUser")
+    check("B28 clear 删除头像文件", not uistore.avatar_file(sandbox, "avatarUser").exists() and await uistore.read_avatar_data_url(sandbox, "avatarUser") == "")
+    await uistore.clear_avatar(sandbox, "avatarUser")
+    check("B29 clear 幂等", True)
+
 
 # ---------------------------------------------------------------------------
 # C. conversation_service.py：umo / 双主键 / CRUD 映射宿主 / 历史读取
@@ -1408,6 +1449,14 @@ async def _test_standalone_logic() -> None:
     resp = await standalone._handle_api(_FakeAioRequest("health"), plugin_l, _FakeAioWeb())
     check("L-20 其余 /api/* 端点无 token 依旧 401", resp["status"] == 401, str(resp))
 
+    # v0.3.1：ui/settings 端点已入独立端口路由表（GET/POST 精确匹配）
+    import re as _re
+
+    get_match = [name for m, pat, name in standalone._API_ROUTES if m == "GET" and _re.fullmatch(pat, "ui/settings")]
+    post_match = [name for m, pat, name in standalone._API_ROUTES if m == "POST" and _re.fullmatch(pat, "ui/settings")]
+    check("L-21 GET ui/settings 入表", get_match == ["handle_get_ui_settings"], str(get_match))
+    check("L-22 POST ui/settings 入表", post_match == ["handle_post_ui_settings"], str(post_match))
+
 
 # ---------------------------------------------------------------------------
 # E. routes.py：精确路由注册 / 错误包 / 端点行为
@@ -1440,6 +1489,7 @@ def test_routes() -> None:
         "/astrbot_plugin_webui/stream/<gen_id>": ["GET"],
         "/astrbot_plugin_webui/upload": ["POST"],
         "/astrbot_plugin_webui/files/<file_id>": ["GET"],
+        "/astrbot_plugin_webui/ui/settings": ["GET", "POST"],
     }
     check("E1 逐端点精确注册", registered == expected, str(registered))
     check("E2 无 <route> 通配", "/astrbot_plugin_webui/<route>" not in registered)
@@ -1566,6 +1616,36 @@ def test_routes() -> None:
         check("E37 done 后 active=None", chat_service.active_generation_id(cid2) is None)
         check("E38 bot 平台历史落库", any(r.content.get("type") == "bot" for r in plugin.context.message_history_manager.rows))
         check("E39 队列已清理", gen2 not in _stub_queue_mgr().back_queues)
+
+        # ── v0.3.1 UI 设置端点（GET/POST ui/settings；头像落盘 User_head/LLM_head.png） ──
+        import base64 as _base64
+
+        stub_request.set_json(None)
+        resp = await call("/astrbot_plugin_webui/ui/settings", "GET")
+        check("E40 GET ui/settings 空态", resp["status"] == 200 and resp["data"]["settings"] == {"avatarUser": "", "avatarAssistant": ""}, str(resp))
+        png_url = "data:image/png;base64," + _base64.b64encode(b"fakepng").decode("ascii")
+        stub_request.set_json({"compact": True, "flowWidth": "wide", "avatarUser": png_url, "avatarAssistant": ""})
+        resp = await call("/astrbot_plugin_webui/ui/settings", "POST")
+        check("E41 POST ui/settings ok", resp["status"] == 200 and resp["data"]["ok"] is True, str(resp))
+        check("E42 头像落盘固定文件名", (sandbox / "User_head.png").is_file() and not (sandbox / "LLM_head.png").exists())
+        check("E43 响应回填头像与设置", resp["data"]["settings"]["avatarUser"] == png_url and resp["data"]["settings"]["compact"] is True and resp["data"]["settings"]["flowWidth"] == "wide", str(resp["data"]))
+        stub_request.set_json(None)
+        resp = await call("/astrbot_plugin_webui/ui/settings", "GET")
+        check("E44 GET 从文件回填头像", resp["data"]["settings"]["avatarUser"] == png_url and resp["data"]["settings"]["compact"] is True and resp["data"]["settings"]["avatarAssistant"] == "", str(resp["data"]))
+        stored = json.loads((sandbox / "ui_settings.json").read_text(encoding="utf-8"))
+        check("E45 设置 JSON 不落头像数据", stored["avatarUser"] == "" and stored["compact"] is True, str(stored))
+        stub_request.set_json({"avatarUser": "data:image/jpeg;base64,AAAA"})
+        resp = await call("/astrbot_plugin_webui/ui/settings", "POST")
+        check("E46 非 PNG data URL 400", resp["status"] == 400 and resp["data"]["error"] == "invalid_request", str(resp))
+        stub_request.set_json({"avatarUser": 123})
+        resp = await call("/astrbot_plugin_webui/ui/settings", "POST")
+        check("E47 非字符串头像 400", resp["status"] == 400 and resp["data"]["error"] == "invalid_request")
+        stub_request.set_json({"compact": False, "avatarUser": ""})
+        resp = await call("/astrbot_plugin_webui/ui/settings", "POST")
+        check("E48 空串清除头像删文件", resp["status"] == 200 and resp["data"]["settings"]["avatarUser"] == "" and not (sandbox / "User_head.png").exists(), str(resp))
+        stub_request.set_json({"compact": False})
+        resp = await call("/astrbot_plugin_webui/ui/settings", "POST")
+        check("E49 头像键缺省按空串处理", resp["status"] == 200 and resp["data"]["settings"]["avatarUser"] == "" and resp["data"]["settings"]["compact"] is False)
 
     asyncio.run(_run())
 

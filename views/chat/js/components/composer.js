@@ -354,7 +354,7 @@ export function createComposer({ root, store, api, t }) {
         setNote(t("composer.imageDisabled", "当前人格的模型可能不支持图片输入，图片附件已禁用"), "warning");
       }
     },
-  }, icon("image", { size: 17 }));
+  }, icon("link", { size: 17 }));
 
   const sendBtn = el("button", {
     class: "send-btn",

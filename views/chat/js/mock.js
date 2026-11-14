@@ -67,7 +67,7 @@ function nowIso(offsetMinutes = 0) {
 
 /* ── 种子数据 ─────────────────────────────────────────── */
 
-const MOCK_VERSION = "0.3.0";
+const MOCK_VERSION = "0.3.1";
 const MOCK_CONCURRENCY = 2;
 const IMAGE_KINDS = new Set(["image"]);
 // 白名单与后端默认值对齐（attachment_service.py IMAGE_EXTENSIONS；
@@ -305,6 +305,11 @@ export function createMockTransport() {
   const files = new Map();
   for (const meta of seed.seededFiles) files.set(meta.file_id, meta);
 
+  /** mock 界面设置存储（模拟宿主 ui_settings.json；页面会话内有效） */
+  let mockUiSettings = {};
+  /** mock 头像“文件”层（模拟 User_head.png / LLM_head.png：POST 落盘、GET 回填） */
+  const mockAvatarFiles = { avatarUser: "", avatarAssistant: "" };
+
   /** @type {Map<string, any>} */
   const gens = new Map();
   /** @type {Map<string, Set<{id: string, onMessage: (p: any) => void, onOpen?: () => void, onError?: () => void, timers: number[]}>>} */
@@ -495,6 +500,10 @@ export function createMockTransport() {
     }
     if (endpoint === "personas") return seed.personas;
     if (endpoint === "conversations") return seed.conversations;
+    if (endpoint === "ui/settings") {
+      // 模拟宿主 GET：设置 JSON 不存头像，从“文件层”回填 data URL
+      return { settings: { ...mockUiSettings, ...mockAvatarFiles } };
+    }
     const historyMatch = /^history\/([A-Za-z0-9_-]+)$/.exec(endpoint);
     if (historyMatch) {
       const cid = historyMatch[1];
@@ -525,6 +534,19 @@ export function createMockTransport() {
 
   async function apiPost(endpoint, body = {}) {
     await netDelay();
+    if (endpoint === "ui/settings") {
+      if (!body || typeof body !== "object" || Array.isArray(body)) {
+        throw new MockHttpError(400, "invalid_request", "settings must be an object (mock)");
+      }
+      // 模拟宿主 POST：头像 data URL 落“盘”（内存文件层，新头像覆盖旧文件），
+      // 设置 JSON 仅存非头像字段（头像字段空串占位）；响应从文件层回填
+      mockUiSettings = { ...body, avatarUser: "", avatarAssistant: "" };
+      for (const key of ["avatarUser", "avatarAssistant"]) {
+        const value = String(body[key] ?? "");
+        mockAvatarFiles[key] = value.startsWith("data:image/png;base64,") ? value : "";
+      }
+      return { ok: true, settings: { ...mockUiSettings, ...mockAvatarFiles } };
+    }
     if (endpoint === "conversations") {
       const personaId = String(body?.persona_id ?? "");
       if (!seed.personas.personas.some((p) => p.id === personaId)) {

@@ -17,6 +17,8 @@
     GET    stream/<gen_id>           SSE（bridge.subscribeSSE；seq=0 全量重放 -> 实时）
     POST   upload                    multipart 单文件 -> 附件元数据；413/415 见契约
     GET    files/<file_id>           原文件（file_response，经索引定位）
+    GET    ui/settings               界面设置全量（头像 data URL 由 User_head/LLM_head.png 回填）
+    POST   ui/settings               保存界面设置（头像 data URL 落盘为固定文件名，覆盖旧文件）
 
 ⚠ 逐端点独立注册**精确路径**，禁止单一 ``<route>`` 通配：宿主把动态段
 ``<name>`` 编译为单段 ``(?P<name>[^/]+)``，只有 ``<path:name>`` 才跨段
@@ -197,6 +199,8 @@ def register_routes(plugin: Star) -> None:
     _reg("stream/<gen_id>", ["GET"], "SSE 订阅（全量重放 + 实时）", handle_stream)
     _reg("upload", ["POST"], "上传单个附件（multipart 字段名 file）", handle_upload)
     _reg("files/<file_id>", ["GET"], "获取附件原文件", handle_files)
+    _reg("ui/settings", ["GET"], "读取界面设置（头像由固定头像文件回填）", handle_get_ui_settings)
+    _reg("ui/settings", ["POST"], "保存界面设置（头像 data URL 落盘为固定文件名）", handle_post_ui_settings)
 
 
 @_endpoint
@@ -381,6 +385,52 @@ async def handle_files(plugin: Star, file_id: str):
     if not disk_path.is_file():
         raise chat_service.SendRejected(404, "not_found", "附件文件已丢失")
     return file_response(disk_path, content_type=meta.get("mime"))
+
+
+@_endpoint
+async def handle_get_ui_settings(plugin: Star):
+    """GET ui/settings —— 界面设置全量；头像字段从 User_head/LLM_head.png 回填 data URL。
+
+    设置 JSON 不落头像数据（头像只存文件），读侧在此统一回填；无文件的头像
+    字段为空串。端点不可达/旧版后端时前端按「沿用本地设置」降级。
+    """
+    data_dir = plugin.data_dir()
+    settings = await uistore.load_ui_settings(data_dir)
+    for key in uistore.AVATAR_FILE_NAMES:
+        settings[key] = await uistore.read_avatar_data_url(data_dir, key)
+    return json_response({"settings": settings})
+
+
+@_endpoint
+async def handle_post_ui_settings(plugin: Star):
+    """POST ui/settings —— body 为前端 uiSettings 全量 dict；头像 data URL 落盘。
+
+    头像字段（avatarUser/avatarAssistant）：PNG data URL → 覆盖写固定文件
+    ``User_head.png`` / ``LLM_head.png``（新头像统一命名替换旧文件）；空串 →
+    删除头像文件；非法 data URL 400。设置 JSON 本身不存头像数据（空串占位，
+    读侧从文件回填），保证头像以文件为唯一权威存储。
+    """
+    body = await _json_body()
+    data_dir = plugin.data_dir()
+    saved = dict(body)
+    for key in uistore.AVATAR_FILE_NAMES:
+        value = body.get(key, "")
+        if not isinstance(value, str):
+            raise chat_service.SendRejected(
+                400, "invalid_request", f"{key} 必须为字符串（PNG data URL 或空串）"
+            )
+        if value == "":
+            await uistore.clear_avatar(data_dir, key)
+        else:
+            try:
+                await uistore.write_avatar_data_url(data_dir, key, value)
+            except ValueError as exc:
+                raise chat_service.SendRejected(400, "invalid_request", str(exc))
+        saved[key] = ""  # 设置 JSON 不落头像数据（GET 时从文件回填）
+    stored = await uistore.save_ui_settings(data_dir, saved)
+    for key in uistore.AVATAR_FILE_NAMES:  # 响应回填文件权威内容
+        stored[key] = await uistore.read_avatar_data_url(data_dir, key)
+    return json_response({"ok": True, "settings": stored})
 
 
 @_endpoint

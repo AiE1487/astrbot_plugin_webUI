@@ -251,6 +251,37 @@ export function createApi(transport) {
     return null;
   }
 
+  /**
+   * GET ui/settings → {settings} —— 宿主侧持久化的界面设置（头像字段由
+   * User_head/LLM_head.png 回填 data URL）。mock / 旧版后端无此端点时抛
+   * ApiError(404)，调用方按「沿用本地设置」降级处理。
+   * @returns {Promise<Record<string, any> | null>}
+   */
+  async function getUiSettings() {
+    try {
+      const data = await transport.apiGet("ui/settings", {});
+      return data?.settings && typeof data.settings === "object" ? data.settings : null;
+    } catch (error) {
+      throw normalizeError(error);
+    }
+  }
+
+  /**
+   * POST ui/settings（body 为 uiSettings 全量）→ {ok, settings}。头像 data URL
+   * 由后端落盘为固定文件（User_head.png / LLM_head.png，覆盖旧文件），响应
+   * settings 为落盘后的权威回读。
+   * @param {Record<string, any>} settings
+   * @returns {Promise<Record<string, any> | null>}
+   */
+  async function saveUiSettings(settings) {
+    try {
+      const data = await transport.apiPost("ui/settings", settings ?? {});
+      return data?.settings && typeof data.settings === "object" ? data.settings : null;
+    } catch (error) {
+      throw normalizeError(error);
+    }
+  }
+
   return {
     health,
     listPersonas,
@@ -263,5 +294,7 @@ export function createApi(transport) {
     upload,
     downloadFile,
     mediaUrl,
+    getUiSettings,
+    saveUiSettings,
   };
 }

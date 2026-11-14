@@ -73,6 +73,7 @@ const ICON_PATHS = {
   terminal: `<rect ${STROKE_ATTRS} x="3" y="4.5" width="18" height="15" rx="2"/><path ${STROKE_ATTRS} d="M7 9.5l3 2.8-3 2.8M12.5 15.5H17"/>`,
   settings: `<path ${STROKE_ATTRS} d="M5 21v-6M5 11V3M12 21v-9M12 8V3M19 21v-4M19 13V3"/><path ${STROKE_ATTRS} d="M2.5 15h5M9.5 8h5M16.5 17h5"/>`,
   camera: `<path ${STROKE_ATTRS} d="M4 8h3l2-2.5h6L17 8h3a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V9a1 1 0 0 1 1-1Z"/><circle ${STROKE_ATTRS} cx="12" cy="13.5" r="3.4"/>`,
+  link: `<path ${STROKE_ATTRS} d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path ${STROKE_ATTRS} d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>`,
 };
 
 /** @type {Map<string, SVGSVGElement>} */

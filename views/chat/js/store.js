@@ -24,6 +24,9 @@ const KEY_CURRENT_CID = "webui.currentCid";
 const KEY_ACTIVE_GENS = "webui.activeGens";
 const KEY_UI_SETTINGS = "webui.uiSettings";
 
+/** UI 设置宿主侧同步防抖（快速连点开关只发最后一帧全量）。 */
+const UI_SETTINGS_SYNC_DEBOUNCE_MS = 400;
+
 /** UI 自定义默认值（W6/W7）：头像默认隐藏，布局/组件按原始设计。 */
 const UI_SETTINGS_DEFAULTS = {
   showAvatars: false,        // 消息头像（默认不显示）
@@ -174,6 +177,39 @@ export function createStore({ api, transport, t }) {
     };
   } catch {
     state.uiSettings = { ...UI_SETTINGS_DEFAULTS };
+  }
+
+  /* ── UI 设置宿主侧持久化（v0.3.1：跨设备/跨入口） ────────
+     本地 safeStorage 仍是会话级兜底；宿主侧为权威持久层：
+     - 拉取：启动时 GET ui/settings 合并（宿主为准，含从
+       User_head.png / LLM_head.png 回填的头像 data URL）；
+     - 推送：updateUiSettings 防抖全量 POST，后端把头像 data URL
+       落盘为固定文件（新头像覆盖旧文件）。mock / 旧版后端无此
+       端点 → 静默沿用本地设置。 */
+
+  /** @returns {Promise<void>} 拉取宿主设置并合并（失败静默，本地不受影响）。 */
+  async function pullRemoteUiSettings() {
+    try {
+      const remote = await api.getUiSettings();
+      if (remote && !Array.isArray(remote)) {
+        state.uiSettings = { ...state.uiSettings, ...remote };
+        emit("ui");
+      }
+    } catch {
+      /* mock / 旧版后端无此端点 → 沿用本地设置 */
+    }
+  }
+
+  let uiSettingsSyncTimer = 0;
+
+  function scheduleUiSettingsSync() {
+    window.clearTimeout(uiSettingsSyncTimer);
+    uiSettingsSyncTimer = window.setTimeout(() => {
+      uiSettingsSyncTimer = 0;
+      api.saveUiSettings({ ...state.uiSettings }).catch((error) => {
+        console.warn("[webui] UI 设置宿主侧同步失败（本地已保存）:", error?.message ?? error);
+      });
+    }, UI_SETTINGS_SYNC_DEBOUNCE_MS);
   }
 
   /* ── 活跃 gen_id 持久化（刷新恢复） ─────────────────── */
@@ -826,8 +862,11 @@ export function createStore({ api, transport, t }) {
     loadConversations,
     loadInitial: async () => {
       loadActiveGens();
+      // 宿主侧 UI 设置（含头像）与人格/会话并行拉取；首条消息渲染前完成合并
+      const remoteSettingsTask = pullRemoteUiSettings();
       await loadPersonas();
       await loadConversations();
+      await remoteSettingsTask;
       // 恢复上次会话，否则取最新一条
       const stored = safeStorage.get(KEY_CURRENT_CID);
       const initial = (stored && state.conversations.some((item) => item.cid === stored))
@@ -862,11 +901,12 @@ export function createStore({ api, transport, t }) {
       state.sidebarCollapsed = value;
       emit("ui");
     },
-    /** UI 自定义合并写入（设置面板；持久化 safeStorage，W7）。 */
+    /** UI 自定义合并写入（设置面板；持久化 safeStorage + 防抖同步宿主侧，W7/v0.3.1）。 */
     updateUiSettings: (patch) => {
       state.uiSettings = { ...state.uiSettings, ...patch };
       safeStorage.setJson(KEY_UI_SETTINGS, state.uiSettings);
       emit("ui");
+      scheduleUiSettingsSync();
     },
     dismissBannerGone: () => {
       state.bannerGone = false;

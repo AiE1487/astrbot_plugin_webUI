@@ -60,6 +60,8 @@ _API_ROUTES: tuple[tuple[str, str, str], ...] = (
     ("POST", r"stop/(?P<gen_id>[^/]+)", "handle_stop"),
     ("GET", r"stream/(?P<gen_id>[^/]+)", "handle_stream"),
     ("GET", r"files/(?P<file_id>[^/]+)", "handle_files"),
+    ("GET", r"ui/settings", "handle_get_ui_settings"),
+    ("POST", r"ui/settings", "handle_post_ui_settings"),
 )
 
 
