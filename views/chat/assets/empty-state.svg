@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 160" role="img" aria-label="empty state decoration">
+<svg xmlns="http://www.w3.org/2000/svg" width="240" height="160" viewBox="0 0 240 160" role="img" aria-label="empty state decoration">
   <!-- 自绘空态装饰：半调点阵 + 网格 + 提示符（复刻风格语言，不引素材，R5） -->
   <defs>
     <pattern id="dots" width="10" height="10" patternUnits="userSpaceOnUse">

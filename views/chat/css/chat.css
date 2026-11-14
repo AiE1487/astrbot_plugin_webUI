@@ -92,7 +92,13 @@
   max-width: 420px;
 }
 
+/* 固定尺寸：SVG 只带 viewBox 时无确定固有尺寸，flex 布局会把它拉伸到容器宽
+   （随消息流宽度档位 860/1080/全宽 变成 764/984/1200px）；显式宽度使其与
+   消息流宽度设置无关，保持等比例原始构图（W7 修复）。 */
 .empty-state .es-decoration {
+  width: 240px;
+  height: auto;
+  flex: none;
   margin-bottom: 6px;
   opacity: 0.9;
 }
