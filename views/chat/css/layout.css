@@ -484,6 +484,9 @@
 
 .overlay-root.overlay-deep {
   background: var(--mask-deep);
+  /* 登录卡（唯一 deep 使用处）须盖过加载屏（z-100）：standalone 401 时加载屏
+     不淡出、作为登录背景，层级低于 100 会被不透明加载屏完全遮住（v0.3.3 修复） */
+  z-index: 110;
 }
 
 @keyframes overlay-in {

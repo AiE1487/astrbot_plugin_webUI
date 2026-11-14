@@ -311,6 +311,7 @@ async function boot() {
           store.state.needsLogin = false;
           overlay.remove();
           await loadData();
+          store.ping(); // 立即落定连接徽标（否则要等下一轮 30s 心跳才从「重连中」恢复）
         } catch (error) {
           const locked = error?.status === 429 || /lock|限速|too many/i.test(String(error?.message ?? ""));
           errorNode.textContent = locked
@@ -370,11 +371,13 @@ async function boot() {
   /* ── 心跳（断线重连横幅驱动） ───────────────────────── */
 
   if (store.state.mode !== "mock") {
+    // 未登录（standalone 401）时跳过心跳：此时 health 必 401，会把连接徽标
+    // 误置为「重连中」（v0.3.3 修复）；登录成功后 needsLogin 翻 false 恢复心跳
     window.setInterval(() => {
-      if (!document.hidden) store.ping();
+      if (!document.hidden && !store.state.needsLogin) store.ping();
     }, 30000);
     document.addEventListener("visibilitychange", () => {
-      if (!document.hidden) store.ping();
+      if (!document.hidden && !store.state.needsLogin) store.ping();
     });
   }
 
