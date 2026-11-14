@@ -67,7 +67,7 @@ function nowIso(offsetMinutes = 0) {
 
 /* ── 种子数据 ─────────────────────────────────────────── */
 
-const MOCK_VERSION = "0.1.0";
+const MOCK_VERSION = "0.3.0";
 const MOCK_CONCURRENCY = 2;
 const IMAGE_KINDS = new Set(["image"]);
 // 白名单与后端默认值对齐（attachment_service.py IMAGE_EXTENSIONS；
@@ -202,6 +202,36 @@ function seedDatasets() {
     },
     usage: { output: 96, total: 512 },
   });
+  // W1：markdown 渲染演示消息（标题/列表/代码块/表格/引用全覆盖，供视觉验收）
+  hist1.push({
+    id: `m_${uuidHex()}`,
+    role: "assistant",
+    ts: nowIso(18),
+    text: [
+      "## Markdown 渲染验证",
+      "",
+      "支持 **加粗**、*斜体*、~~删除线~~、行内代码 `astrbot_execute_shell`，以及自动链接 https://astrbot.app 。",
+      "",
+      "- 列表项一：流式增量逐段渲染",
+      "- 列表项二：代码块与表格",
+      "  - 嵌套项：一层缩进",
+      "",
+      "```python",
+      "def greet(name: str) -> str:",
+      '    return f"你好，{name}！"  # 围栏代码块',
+      "",
+      'print(greet("astrbot"))',
+      "```",
+      "",
+      "| 通道 | 状态 |",
+      "| --- | --- |",
+      "| 流式回复 | OK |",
+      "| 附件 | OK |",
+      "",
+      "> 引用块：酒馆风 UI，深色底 + 青色锚线。",
+    ].join("\n"),
+    usage: { output: 210, total: 1240 },
+  });
   histories.set(c1, hist1);
 
   // 会话 2：工具调用示例（含一个 error 结果的工具）
@@ -229,7 +259,26 @@ function seedDatasets() {
 /* ── 假回复文案 ───────────────────────────────────────── */
 
 const CANNED_REPLIES = [
-  "收到。明日方舟风格的深色界面里，正文以 #282828 卡片呈现，左侧带一条青色竖线作为 AI 消息的视觉锚点。\n流式增量会逐段追加进这一段文本，直到 done 事件把它落定为历史消息。",
+  [
+    "收到。用一段 markdown 验证渲染（W1）：",
+    "",
+    "## 要点小结",
+    "",
+    "- **加粗**、*斜体*、~~删除线~~ 与行内代码 `get_weather`",
+    "- 自动链接：https://github.com/AstrBotDevs/AstrBot",
+    "  - 一层嵌套列表项",
+    "",
+    "```python",
+    'print("hello from astrbot")  # 围栏代码块',
+    "```",
+    "",
+    "| 通道 | 状态 |",
+    "| --- | --- |",
+    "| 流式渲染 | OK |",
+    "| 工具面板 | OK |",
+    "",
+    "> 深色卡片 + 左侧青线是 AI 消息的视觉锚点，直到 done 事件落定。",
+  ].join("\n"),
   "好的，这里是一段用于验证流式渲染的 mock 回复：包含多行文本、标点，与较长段落，用来观察自动滚动与打字光标行为。\n第二行用来验证换行保持。\n第三行验证段落间距。",
   "示例答复：会话列表按 NO.01 编号装饰，右轨显示大号青色会话编号与半调网点纹理。你可以在侧栏新建、切换或删除会话（删除会弹页内自绘确认框）。",
 ];

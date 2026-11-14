@@ -11,6 +11,13 @@ function pad2(value) {
   return String(value + 1).padStart(2, "0");
 }
 
+/** 手机端竖屏（抽屉模式，W3）：选中会话/人格后自动收起抽屉。 */
+function collapseDrawerOnMobile(store) {
+  if (window.matchMedia("(max-width: 900px)").matches && !store.state.sidebarCollapsed) {
+    store.setSidebarCollapsed(true);
+  }
+}
+
 /** @param {string} iso */
 function shortDate(iso) {
   const date = new Date(iso);
@@ -64,13 +71,17 @@ export function createSidebar({ root, store, t, version }) {
   async function pickPersona(persona) {
     closeMenu();
     const current = store.conversationOf(store.state.currentCid);
-    if (current?.persona_id === persona.id) return; // 当前会话已是该人格
+    if (current?.persona_id === persona.id) {
+      collapseDrawerOnMobile(store);
+      return; // 当前会话已是该人格
+    }
     try {
       await store.createConversation(persona.id);
       toast(t("toast.personaSwitched", "已新建人格会话"), "success");
     } catch (error) {
       toast(error?.message || t("error.loadFailed", "加载失败"), "error");
     }
+    collapseDrawerOnMobile(store);
   }
 
   /** @param {any[]} personas */
@@ -118,7 +129,9 @@ export function createSidebar({ root, store, t, version }) {
         toast(t("toast.created", "会话已创建"), "success");
       } catch (error) {
         toast(error?.message || t("error.loadFailed", "加载失败"), "error");
+        return;
       }
+      collapseDrawerOnMobile(store);
     },
   }, icon("plus", { size: 14 }));
 
@@ -167,7 +180,10 @@ export function createSidebar({ root, store, t, version }) {
         class: `convo-item${convo.cid === currentCid ? " is-active" : ""}`,
         type: "button",
         role: "listitem",
-        onclick: () => store.switchConversation(convo.cid),
+        onclick: () => {
+          store.switchConversation(convo.cid);
+          collapseDrawerOnMobile(store); // 手机端：选中后收起抽屉看对话
+        },
       },
         el("span", { class: "ci-no", text: `NO.${pad2(index)}` }),
         el("span", { class: "ci-main" },

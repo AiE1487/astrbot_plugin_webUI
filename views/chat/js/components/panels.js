@@ -211,6 +211,186 @@ export function openLightbox({ meta, api, t, canFetchOriginal }) {
   document.body.appendChild(overlay);
 }
 
+/* ══ 设置面板（W7：UI 布局与组件自定义；数据经 store.uiSettings 持久化） ══ */
+
+/** 头像文件 → 160px PNG data URL（压缩体积以适配 safeStorage）。 */
+async function avatarToDataUrl(file) {
+  try {
+    const bitmap = await createImageBitmap(file);
+    const scale = Math.min(1, 160 / Math.max(bitmap.width, bitmap.height));
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.max(1, Math.round(bitmap.width * scale));
+    canvas.height = Math.max(1, Math.round(bitmap.height * scale));
+    const ctx = /** @type {CanvasRenderingContext2D} */ (canvas.getContext("2d"));
+    ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+    bitmap.close?.();
+    return canvas.toDataURL("image/png");
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * @param {{store: any, t: (key: string, fallback?: string) => string}} deps
+ */
+export function openSettingsPanel({ store, t }) {
+  const fileInput = el("input", { type: "file", accept: "image/*", style: { display: "none" } });
+  const unsubscribers = [];
+  let pickingKey = "";
+  fileInput.addEventListener("change", async () => {
+    const file = fileInput.files?.[0] ?? null;
+    fileInput.value = "";
+    if (!file || !pickingKey) return;
+    const dataUrl = await avatarToDataUrl(file);
+    if (dataUrl) store.updateUiSettings({ [pickingKey]: dataUrl });
+    else toast(t("settings.avatar.decodeFailed", "图片解析失败，请换一张图片"), "error");
+  });
+
+  /** 开关行（role=switch，写回 uiSettings）。 */
+  function switchRow(labelKey, fallback, settingKey) {
+    const sw = el("button", {
+      class: "ui-switch",
+      type: "button",
+      role: "switch",
+      "aria-checked": String(Boolean(store.state.uiSettings[settingKey])),
+      onclick: () => {
+        const next = sw.getAttribute("aria-checked") !== "true";
+        sw.setAttribute("aria-checked", String(next));
+        store.updateUiSettings({ [settingKey]: next });
+      },
+    }, el("span", { class: "ui-switch-thumb" }));
+    return el("div", { class: "sp-row" },
+      el("span", { class: "sp-label", text: t(labelKey, fallback) }),
+      sw,
+    );
+  }
+
+  /** 头像选择行：圆形预览 + 上传/清除。 */
+  function avatarRow(labelKey, fallback, settingKey) {
+    const preview = el("span", { class: "sp-avatar-preview" });
+    const syncPreview = () => {
+      const url = store.state.uiSettings[settingKey];
+      preview.replaceChildren();
+      preview.classList.toggle("has-img", Boolean(url));
+      if (url) preview.appendChild(el("img", { src: String(url), alt: "" }));
+      else preview.appendChild(icon("camera", { size: 18 }));
+    };
+    syncPreview();
+    // ui topic（设置变更）时刷新预览；面板关闭时退订
+    unsubscribers.push(store.on((topics) => {
+      if (topics.has("ui")) syncPreview();
+    }));
+    const uploadBtn = el("button", {
+      class: "btn-secondary sp-btn",
+      type: "button",
+      text: t("settings.avatar.upload", "上传"),
+      onclick: () => {
+        pickingKey = settingKey;
+        fileInput.click();
+      },
+    });
+    const clearBtn = el("button", {
+      class: "btn-secondary sp-btn",
+      type: "button",
+      text: t("settings.avatar.clear", "清除"),
+      onclick: () => store.updateUiSettings({ [settingKey]: "" }),
+    });
+    return el("div", { class: "sp-row" },
+      el("span", { class: "sp-label", text: t(labelKey, fallback) }),
+      el("span", { class: "sp-avatar-controls" }, preview, uploadBtn, clearBtn),
+    );
+  }
+
+  /** 消息流宽度分段选择。 */
+  function flowWidthRow() {
+    const options = [
+      { value: "normal", label: t("settings.flowWidth.normal", "标准") },
+      { value: "wide", label: t("settings.flowWidth.wide", "宽") },
+      { value: "full", label: t("settings.flowWidth.full", "全宽") },
+    ];
+    const seg = el("div", { class: "sp-seg" });
+    const render = () => {
+      seg.replaceChildren(...options.map((opt) => el("button", {
+        class: `sp-seg-btn${store.state.uiSettings.flowWidth === opt.value ? " is-active" : ""}`,
+        type: "button",
+        text: opt.label,
+        onclick: () => {
+          store.updateUiSettings({ flowWidth: opt.value });
+          render();
+        },
+      })));
+    };
+    render();
+    return el("div", { class: "sp-row" },
+      el("span", { class: "sp-label", text: t("settings.flowWidth", "消息流宽度") }),
+      seg,
+    );
+  }
+
+  function section(label, ...rows) {
+    return el("div", { class: "sc-section" },
+      el("div", { class: "sc-section-label", text: label }),
+      ...rows,
+    );
+  }
+
+  const closeButton = el("button", {
+    class: "sc-close",
+    type: "button",
+    "aria-label": t("dialog.close", "关闭"),
+    onclick: () => close(),
+  }, icon("close", { size: 14 }));
+
+  const card = el("div", { class: "settings-card", role: "document" },
+    el("div", { class: "sc-head" },
+      el("div", { class: "sc-title", text: t("settings.title", "界面设置") }),
+      closeButton,
+    ),
+    el("div", { class: "sc-body" },
+      section(
+        t("settings.section.avatars", "头像"),
+        switchRow("settings.showAvatars", "显示消息头像", "showAvatars"),
+        avatarRow("settings.avatarUser", "用户头像", "avatarUser"),
+        avatarRow("settings.avatarAssistant", "AI 头像", "avatarAssistant"),
+        el("div", { class: "sc-hint", text: t("settings.avatarHint", "头像默认隐藏；未上传时 AI 显示人格名首字徽标，用户显示图标。") }),
+      ),
+      section(
+        t("settings.section.layout", "布局"),
+        flowWidthRow(),
+        switchRow("settings.compact", "紧凑模式", "compact"),
+      ),
+      section(
+        t("settings.section.components", "消息组件"),
+        switchRow("settings.showTimestamps", "显示时间戳", "showTimestamps"),
+        switchRow("settings.showUsage", "显示 TOKENS 用量", "showUsage"),
+        switchRow("settings.showReasoningDefault", "思考内容默认展开", "showReasoningDefault"),
+      ),
+    ),
+    fileInput,
+  );
+
+  const overlay = el("div", {
+    class: "overlay-root",
+    role: "dialog",
+    "aria-modal": "true",
+    "aria-label": t("settings.title", "界面设置"),
+    onclick: (event) => {
+      if (event.target === overlay) close();
+    },
+  }, card);
+
+  const onKeydown = (event) => {
+    if (event.key === "Escape") close();
+  };
+  function close() {
+    document.removeEventListener("keydown", onKeydown);
+    for (const off of unsubscribers) off();
+    overlay.remove();
+  }
+  document.addEventListener("keydown", onKeydown);
+  document.body.appendChild(overlay);
+}
+
 /* ══ Toast（413/415/409 等即时提示；M3 ② / M4 ②） ══════ */
 
 let toastRoot = null;

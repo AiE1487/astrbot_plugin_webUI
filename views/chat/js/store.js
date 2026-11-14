@@ -22,6 +22,19 @@ import { toast } from "./components/panels.js";
 
 const KEY_CURRENT_CID = "webui.currentCid";
 const KEY_ACTIVE_GENS = "webui.activeGens";
+const KEY_UI_SETTINGS = "webui.uiSettings";
+
+/** UI 自定义默认值（W6/W7）：头像默认隐藏，布局/组件按原始设计。 */
+const UI_SETTINGS_DEFAULTS = {
+  showAvatars: false,        // 消息头像（默认不显示）
+  avatarUser: "",            // 用户头像 data URL（空 = 图标兜底）
+  avatarAssistant: "",       // AI（人格）头像 data URL（空 = 人格名首字徽标）
+  showTimestamps: true,      // meta 行时间戳
+  showUsage: true,           // TOKENS 用量脚注
+  showReasoningDefault: false, // 思考内容默认展开（初值取宿主配置）
+  flowWidth: "normal",       // 消息流宽度：normal(860) | wide(1080) | full
+  compact: false,            // 紧凑模式（更小间距/内边距）
+};
 
 /** @returns {string} */
 function localId() {
@@ -137,6 +150,7 @@ export function createStore({ api, transport, t }) {
     switchTick: 0, // 会话切换动画标记（每次切换 +1，组件据此重播动画）
     bannerGone: false, // 流 404/过期横幅
     showReasoningDefault: false,
+    uiSettings: { ...UI_SETTINGS_DEFAULTS },
     lastError: /** @type {{kind: string, message: string}|null} */ (null),
   };
 
@@ -148,6 +162,18 @@ export function createStore({ api, transport, t }) {
     }
   } catch {
     /* 保持默认 */
+  }
+
+  // UI 自定义（W6/W7）：默认 ← 宿主配置 ← 用户设置（持久于 safeStorage）
+  try {
+    const storedSettings = safeStorage.getJson(KEY_UI_SETTINGS);
+    state.uiSettings = {
+      ...UI_SETTINGS_DEFAULTS,
+      showReasoningDefault: state.showReasoningDefault,
+      ...(storedSettings && typeof storedSettings === "object" ? storedSettings : {}),
+    };
+  } catch {
+    state.uiSettings = { ...UI_SETTINGS_DEFAULTS };
   }
 
   /* ── 活跃 gen_id 持久化（刷新恢复） ─────────────────── */
@@ -834,6 +860,12 @@ export function createStore({ api, transport, t }) {
     },
     setSidebarCollapsed: (value) => {
       state.sidebarCollapsed = value;
+      emit("ui");
+    },
+    /** UI 自定义合并写入（设置面板；持久化 safeStorage，W7）。 */
+    updateUiSettings: (patch) => {
+      state.uiSettings = { ...state.uiSettings, ...patch };
+      safeStorage.setJson(KEY_UI_SETTINGS, state.uiSettings);
       emit("ui");
     },
     dismissBannerGone: () => {

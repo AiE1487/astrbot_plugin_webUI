@@ -71,6 +71,8 @@ const ICON_PATHS = {
   tool: `<path d="M13.2 2 5 13.2h5.2L9 22l8.6-11.2h-5.4L13.2 2Z" fill="currentColor" stroke="none"/>`,
   check: `<path ${STROKE_ATTRS} d="M5 13l4.2 4.2L19 7"/>`,
   terminal: `<rect ${STROKE_ATTRS} x="3" y="4.5" width="18" height="15" rx="2"/><path ${STROKE_ATTRS} d="M7 9.5l3 2.8-3 2.8M12.5 15.5H17"/>`,
+  settings: `<path ${STROKE_ATTRS} d="M5 21v-6M5 11V3M12 21v-9M12 8V3M19 21v-4M19 13V3"/><path ${STROKE_ATTRS} d="M2.5 15h5M9.5 8h5M16.5 17h5"/>`,
+  camera: `<path ${STROKE_ATTRS} d="M4 8h3l2-2.5h6L17 8h3a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V9a1 1 0 0 1 1-1Z"/><circle ${STROKE_ATTRS} cx="12" cy="13.5" r="3.4"/>`,
 };
 
 /** @type {Map<string, SVGSVGElement>} */

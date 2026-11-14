@@ -18,12 +18,17 @@ import { createStore } from "./store.js";
 import { createSidebar } from "./components/sidebar.js";
 import { createMessageFlow } from "./components/message.js";
 import { createComposer } from "./components/composer.js";
-import { toast } from "./components/panels.js";
+import { openSettingsPanel, toast } from "./components/panels.js";
 import { el, icon } from "./icons.js";
 
 /** @param {string} id */
 function byId(id) {
   return /** @type {HTMLElement} */ (document.getElementById(id));
+}
+
+/** 手机端竖屏/窄视口（侧栏改抽屉模式）。 */
+function isNarrowViewport() {
+  return window.matchMedia("(max-width: 900px)").matches;
 }
 
 async function boot() {
@@ -62,6 +67,8 @@ async function boot() {
 
   const api = createApi(transport);
   const store = createStore({ api, transport, t });
+  // 手机端竖屏默认收起侧栏（抽屉模式；W3）：点右上按钮展开为浮层
+  if (isNarrowViewport()) store.state.sidebarCollapsed = true;
 
   /* ── 顶栏 ───────────────────────────────────────────── */
 
@@ -97,6 +104,14 @@ async function boot() {
       renderTexts();
     },
   });
+  const settingsBtn = el("button", {
+    class: "icon-btn",
+    type: "button",
+    "aria-label": t("settings.title", "界面设置"),
+    title: t("settings.title", "界面设置"),
+    onclick: () => openSettingsPanel({ store, t }),
+  }, icon("settings", { size: 15 }));
+
   const sidebarToggle = el("button", {
     class: "icon-btn",
     type: "button",
@@ -109,8 +124,11 @@ async function boot() {
     brand,
     personaIndicator,
     el("div", { class: "topbar-spacer" }),
-    el("div", { class: "topbar-actions" }, connChip, localeBtn, sidebarToggle),
+    el("div", { class: "topbar-actions" }, connChip, localeBtn, settingsBtn, sidebarToggle),
   );
+
+  // 手机端抽屉 backdrop（W3）：点击空白收起抽屉
+  byId("sidebar-backdrop")?.addEventListener("click", () => store.setSidebarCollapsed(true));
 
   /* ── 右轨 ───────────────────────────────────────────── */
 
@@ -135,13 +153,6 @@ async function boot() {
     t,
     onPinnedChange: (pinned) => {
       jumpChip?.classList.toggle("is-visible", !pinned);
-    },
-    onPersonaPick: async (personaId) => {
-      try {
-        await store.createConversation(personaId);
-      } catch (error) {
-        toast(error?.message || t("error.loadFailed", "加载失败"), "error");
-      }
     },
   });
   const composer = createComposer({ root: composerRoot, store, api, t });
@@ -249,8 +260,14 @@ async function boot() {
       bannerSlot.appendChild(mockBanner);
     }
 
-    // 侧栏折叠
+    // 侧栏折叠（W3）：折叠态挂 #app（桌面网格列归零 → 对话区扩展；手机端抽屉收起）
+    appRoot.classList.toggle("app-sidebar-collapsed", store.state.sidebarCollapsed);
     sidebarRoot.classList.toggle("sidebar-collapsed", store.state.sidebarCollapsed);
+    // 布局/密度自定义（W7 设置面板 → CSS 变量与类）
+    const uiSettings = store.state.uiSettings ?? {};
+    appRoot.classList.toggle("flow-wide", uiSettings.flowWidth === "wide");
+    appRoot.classList.toggle("flow-full", uiSettings.flowWidth === "full");
+    appRoot.classList.toggle("density-compact", Boolean(uiSettings.compact));
     localeBtn.style.display = store.state.mode === "bridge" || store.state.mode === "fallback" ? "none" : "";
     localeBtn.textContent = store.state.locale.startsWith("zh") ? "EN" : "中";
   }
@@ -264,6 +281,8 @@ async function boot() {
         ? t("conn.offline", "离线")
         : t("conn.ok", "已连接");
     document.title = `${t("title", "对话")} · astrbot_plugin_webui`;
+    settingsBtn.setAttribute("aria-label", t("settings.title", "界面设置"));
+    settingsBtn.setAttribute("title", t("settings.title", "界面设置"));
     sidebar.renderTexts();
     composer.renderTexts();
     messageFlow.renderAll();

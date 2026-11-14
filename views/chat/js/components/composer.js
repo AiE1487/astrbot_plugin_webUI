@@ -4,9 +4,9 @@
  * - 发送 → POST send 得 gen_id 即订阅（订阅在 store.sendMessage → streams.ensure）。
  * - 停止 → POST stop/<gen_id> 后等 stopped 终态落 UI（契约：服务端先落终态再 cancel）。
  * - 409 双分支文案：session_busy / concurrency_limit。
- * - 附件：附件按钮 → image/text 白名单过滤 → 图片 canvas 压缩长边≤2048 再 upload
- *   （toBlob 异步完成后再提交 FormData）→ 预览条（缩略图/文件卡 + 可移除）→
- *   发送携 file_ids；upload 413/415 立即提示并阻断；
+ * - 附件：附件按钮 / 拖拽 / Ctrl+V 直接粘贴（W5）→ image/text 白名单过滤 →
+ *   图片 canvas 压缩长边≤2048 再 upload（toBlob 异步完成后再提交 FormData）→
+ *   预览条（缩略图/文件卡 + 可移除）→ 发送携 file_ids；upload 413/415 立即提示并阻断；
  *   personas.image_capable=false 预禁图片入口（仅启发式预检，最终裁决在生成期）。
  */
 
@@ -31,6 +31,39 @@ function formatSize(size) {
   if (size < 1024) return `${size}B`;
   if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)}KB`;
   return `${(size / (1024 * 1024)).toFixed(1)}MB`;
+}
+
+/** @param {DataTransfer|null} clipboardData */
+function filesFromClipboard(clipboardData) {
+  if (!clipboardData) return [];
+  /** @type {File[]} */
+  const files = [];
+  for (const item of Array.from(clipboardData.items ?? [])) {
+    if (item.kind !== "file") continue;
+    const file = item.getAsFile();
+    if (file) files.push(file);
+  }
+  return files;
+}
+
+/** @param {string} mime */
+function fallbackClipboardName(mime) {
+  const map = {
+    "image/png": "png",
+    "image/jpeg": "jpg",
+    "image/webp": "webp",
+    "image/gif": "gif",
+    "image/svg+xml": "svg",
+    "text/plain": "txt",
+    "text/markdown": "md",
+    "application/json": "json",
+    "text/csv": "csv",
+    "text/x-python": "py",
+    "application/pdf": "pdf",
+  };
+  const ext = map[String(mime || "").toLowerCase()] || "bin";
+  const stamp = new Date().toISOString().replace(/[-:TZ.]/g, "").slice(0, 14);
+  return `clipboard-${stamp}.${ext}`;
 }
 
 /**
@@ -201,7 +234,14 @@ export function createComposer({ root, store, api, t }) {
       return;
     }
     const imageCapable = store.state.imageCapable;
-    for (const file of files) {
+    for (const rawFile of files) {
+      // 粘贴的剪贴板文件可能没有文件名（截图等）：按 MIME 兜底命名
+      const file = rawFile && rawFile.name
+        ? rawFile
+        : new File([rawFile], fallbackClipboardName(rawFile?.type), {
+            type: rawFile?.type || "application/octet-stream",
+            lastModified: Date.now(),
+          });
       const ext = extOf(file.name);
       const isImage = (file.type || "").startsWith("image/") || IMAGE_EXTS.has(ext);
       const isText = !isImage && ((file.type || "").startsWith("text/") || TEXT_EXTS.has(ext));
@@ -453,11 +493,52 @@ export function createComposer({ root, store, api, t }) {
     }
   });
 
+  /* ── 粘贴上传（W5：Ctrl+V 直接粘贴附件） ──────────────── */
+
+  /**
+   * 粘贴含文件时的处理：进附件管线；随带的纯文本仍插入输入框（图文混合粘贴）。
+   * @param {ClipboardEvent} event
+   * @returns {boolean} 是否接管了该事件（含文件）
+   */
+  function handlePaste(event) {
+    const files = filesFromClipboard(event.clipboardData);
+    if (files.length === 0) return false;
+    event.preventDefault();
+    if (isLegacyConvo()) {
+      toast(legacyNoticeText(), "warning");
+      return true;
+    }
+    const text = event.clipboardData?.getData("text/plain") ?? "";
+    if (text) insertTextAtCursor(text);
+    addFiles(files);
+    return true;
+  }
+
+  // 输入框内粘贴（主入口）
+  textarea.addEventListener("paste", (event) => {
+    handlePaste(event);
+  });
+  // 焦点不在输入框时（消息流等区域）Ctrl+V 也能粘贴附件；输入框已接管过则跳过
+  document.addEventListener("paste", (event) => {
+    if (event.defaultPrevented) return;
+    handlePaste(event);
+  });
+
   function autoGrow() {
     textarea.style.height = "auto";
     textarea.style.height = `${Math.min(160, Math.max(42, textarea.scrollHeight))}px`;
   }
   textarea.addEventListener("input", autoGrow);
+
+  /** 在光标处插入文本（图文混合粘贴时保留文字部分）。@param {string} text */
+  function insertTextAtCursor(text) {
+    const start = textarea.selectionStart ?? textarea.value.length;
+    const end = textarea.selectionEnd ?? textarea.value.length;
+    textarea.value = textarea.value.slice(0, start) + text + textarea.value.slice(end);
+    const pos = start + text.length;
+    textarea.setSelectionRange(pos, pos);
+    autoGrow();
+  }
 
   /* ── 装配 ───────────────────────────────────────────── */
 

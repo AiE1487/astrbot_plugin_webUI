@@ -27,19 +27,25 @@
   opacity: 1;
 }
 
-/* 窄视口降级：右轨隐藏、侧栏改为浮层 */
-@media (max-width: 900px) {
-  #app {
-    grid-template-columns: var(--sidebar-w) minmax(0, 1fr);
-    grid-template-areas:
-      "topbar topbar"
-      "sidebar main"
-      "sidebar composer";
-  }
+/* 侧栏折叠（W3）：折叠类挂 #app，桌面端首列收为 0 —— 对话区/输入区真正扩展占满
+   （原实现只把 #sidebar 宽度归零，网格列仍保留 280px 导致对话区停在原地）。
+   grid-template-columns 可过渡（现代浏览器），与侧栏 width 过渡叠加为顺滑动画。 */
+#app.app-sidebar-collapsed {
+  grid-template-columns: 0 minmax(0, 1fr) var(--rail-w);
+}
 
-  #right-rail {
-    display: none;
-  }
+/* 消息流宽度自定义（W7 设置面板：标准 860 / 宽 1080 / 全宽；覆盖 :root 变量） */
+#app.flow-wide {
+  --flow-max: 1080px;
+}
+
+#app.flow-full {
+  --flow-max: 100%;
+}
+
+/* 手机端抽屉遮罩基础态（W3）：桌面端恒不参与布局与渲染（避免占据网格单元） */
+#sidebar-backdrop {
+  display: none;
 }
 
 /* ══ 顶栏 ══════════════════════════════════════════════ */
@@ -483,4 +489,70 @@
 @keyframes overlay-in {
   from { opacity: 0; }
   to { opacity: 1; }
+}
+
+/* ══ 窄视口（手机端竖屏，W3）══════════════════════════════
+   放在文件末尾以覆盖上方所有同特异性基础规则（#sidebar/#right-rail）：
+   右轨隐藏、侧栏改抽屉浮层、网格只保留主列，对话区恒占满；
+   抽屉经 transform 滑入滑出，展开时显示遮罩。 */
+@media (max-width: 900px) {
+  #app,
+  #app.app-sidebar-collapsed {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-areas:
+      "topbar"
+      "main"
+      "composer";
+  }
+
+  /* 顶栏中央人格指示器在窄屏与状态徽标重叠；人格名在抽屉内已展示 */
+  #persona-indicator {
+    display: none;
+  }
+
+  #right-rail {
+    display: none;
+  }
+
+  #sidebar {
+    position: fixed;
+    top: var(--topbar-h);
+    bottom: 0;
+    left: 0;
+    z-index: 45;
+    width: var(--sidebar-w);
+    max-width: 84vw;
+    transform: translateX(-104%);
+    transition: transform var(--t-fast) var(--ease-out);
+    box-shadow: 12px 0 32px rgba(0, 0, 0, 0.55);
+  }
+
+  /* 抽屉展开（非折叠态）：滑入；宽度不参与动画，避免与 transform 叠加抖动 */
+  #app:not(.app-sidebar-collapsed) #sidebar,
+  #app:not(.app-sidebar-collapsed) #sidebar.sidebar-collapsed {
+    transform: translateX(0);
+    width: var(--sidebar-w);
+    border-right-width: 1px;
+  }
+
+  #sidebar.sidebar-collapsed {
+    transition: transform var(--t-fast) var(--ease-out);
+  }
+
+  /* 抽屉展开时的遮罩：点击空白收起（app.js 绑定） */
+  #sidebar-backdrop {
+    position: fixed;
+    top: var(--topbar-h);
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 44;
+    background: var(--mask-deep);
+    display: none;
+    animation: overlay-in var(--t-fast) var(--ease-out);
+  }
+
+  #app:not(.app-sidebar-collapsed) #sidebar-backdrop {
+    display: block;
+  }
 }

@@ -1,16 +1,21 @@
 /**
- * message.js — 消息流渲染（M2 ③ / M3 ④⑤ / M4 ②）。
+ * message.js — 消息流渲染（M2 ③ / M3 ④⑤ / M4 ② + W1/W2/W4/W6）。
  *
  * 渲染策略（增量渲染合并 DOM 写入）：
  * - 'messages' topic → 全量重建（页面加载 / 发送 / 终态落定 / 分页，频率低）；
- * - 'stream' topic → 仅原位更新流式占位消息的文本节点 / 思考区 / 工具面板，
- *   不重建整列表；store 层已按微任务合并同帧多次事件。
- * - 用户消息右对齐青描边；AI 卡片 #282828 + 左青线（§6.2）；
- *   reasoning 折叠区流式自动展开 + 呼吸光标、完成自动收起、可点击回看；
- *   历史分页向上 prepend（页+1），滚动位置保持。
+ * - 'stream' topic → 仅原位更新流式占位消息的 markdown 正文 / 思考区 / 工具面板，
+ *   不重建整列表；store 层已按微任务合并同帧多次事件，markdown 重渲染再经
+ *   100ms 时间节流合帧（setTimeout 兜底，后台标签页 rAF 不触发的场景也能渲染）。
+ * - 正文与用户输入均经 markdown.js 渲染（DOM 构建，零 innerHTML）；
+ * - AI 消息的 meta 标签显示当前会话人格名（无人格时回退 "AI"）；
+ * - 可选头像（uiSettings.showAvatars，默认关闭）：AI 用人格头像/人格名首字徽标，
+ *   用户用自定义头像/图标；时间戳与 TOKENS 用量可经设置面板开关；
+ * - 无会话空态仅提示「暂无对话」（默认人格自动建会话，无需选人格组件）；
+ * - 历史分页向上 prepend（页+1），滚动位置保持。
  */
 
 import { el, icon } from "../icons.js";
+import { renderMarkdown, placeCursorAtEnd } from "../markdown.js";
 import { createToolPanel, openLightbox, toast } from "./panels.js";
 
 /** @param {string} iso */
@@ -29,6 +34,25 @@ function formatSize(size) {
 }
 
 /**
+ * markdown 正文渲染进宿主容器；流式光标放最后一块可承载文本内。
+ * @param {HTMLElement} host
+ * @param {string} text
+ * @param {HTMLElement} [cursor] 光标（display:none 时不放置）
+ */
+function applyMarkdown(host, text, cursor) {
+  host.replaceChildren();
+  if (!text) {
+    host.style.display = "none"; // 兜底（CSS :empty 同效果）
+    return;
+  }
+  host.style.display = "";
+  host.appendChild(renderMarkdown(text));
+  if (cursor && cursor.style.display !== "none") {
+    placeCursorAtEnd(/** @type {HTMLElement} */ (host.firstElementChild), cursor);
+  }
+}
+
+/**
  * @param {{
  *   scrollEl: HTMLElement,      // #chat-scroll（滚动容器）
  *   store: any,
@@ -36,10 +60,9 @@ function formatSize(size) {
  *   transport: any,
  *   t: (key: string, fallback?: string, vars?: Record<string, string>) => string,
  *   onPinnedChange?: (pinned: boolean) => void,
- *   onPersonaPick: (personaId: string) => void,
  * }} deps
  */
-export function createMessageFlow({ scrollEl, store, api, transport, t, onPinnedChange, onPersonaPick }) {
+export function createMessageFlow({ scrollEl, store, api, transport, t, onPinnedChange }) {
   const flow = el("div", { class: "message-flow" });
   scrollEl.appendChild(flow);
 
@@ -47,7 +70,7 @@ export function createMessageFlow({ scrollEl, store, api, transport, t, onPinned
   let pinned = true;
   /** @type {Map<string, boolean>} 用户手动开合的 reasoning（id → open） */
   const reasoningToggled = new Map();
-  /** @type {{genId: string, textNode: Text, cursor: HTMLElement, reasoningWrap: HTMLElement, reasoningText: Text, reasoningCursor: HTMLElement, reasoningHeadState: HTMLElement, reasoningBlock: HTMLElement, toolsHolder: HTMLElement, waitRow: HTMLElement, panels: Map<string, {update: Function}>, msgId: string} | null} */
+  /** @type {{genId: string, msgId: string, mdHost: HTMLElement, cursor: HTMLElement, latestText: string, reasoningWrap: HTMLElement, reasoningText: Text, reasoningCursor: HTMLElement, reasoningHeadState: HTMLElement, reasoningBlock: HTMLElement, toolsHolder: HTMLElement, waitRow: HTMLElement, panels: Map<string, {update: Function}>} | null} */
   let streamingRefs = null;
   let loadMoreBusy = false;
 
@@ -64,9 +87,11 @@ export function createMessageFlow({ scrollEl, store, api, transport, t, onPinned
       scrollEl.scrollTop = scrollEl.scrollHeight;
       return;
     }
-    requestAnimationFrame(() => {
+    // setTimeout 而非 rAF：后台/节流标签页中 rAF 可能整帧不触发，
+    // 会导致自动滚动失效（流式渲染同理，见下方时间节流说明）
+    window.setTimeout(() => {
       scrollEl.scrollTop = scrollEl.scrollHeight;
-    });
+    }, 0);
   }
 
   async function loadMore() {
@@ -79,9 +104,9 @@ export function createMessageFlow({ scrollEl, store, api, transport, t, onPinned
     try {
       await store.fetchHistoryPage(cid, entry.page + 1);
       // onStoreChange 里的 renderAll 已重建；恢复滚动锚点，使视觉停留在原消息
-      requestAnimationFrame(() => {
+      window.setTimeout(() => {
         scrollEl.scrollTop = prevTop + (scrollEl.scrollHeight - prevHeight);
-      });
+      }, 0);
     } catch (error) {
       toast(error?.message || t("error.loadFailed", "加载失败"), "error");
     } finally {
@@ -103,6 +128,38 @@ export function createMessageFlow({ scrollEl, store, api, transport, t, onPinned
   });
 
   /* ── 子结构构建 ─────────────────────────────────────── */
+
+  /** 当前会话的 AI 展示名：会话人格名（W2）；无人格回退 "AI"。 */
+  function assistantLabel() {
+    const convo = store.conversationOf(currentCid);
+    return store.personaOf(convo?.persona_id)?.name ?? t("msg.roleAssistant", "AI");
+  }
+
+  /** 用户展示名（meta 行）。 */
+  function userLabel() {
+    return t("msg.roleUser", "USER");
+  }
+
+  /**
+   * 头像（W6，默认关闭）：自定义头像图优先；否则 AI 用人格名首字徽标、用户用图标。
+   * @param {boolean} isUser
+   */
+  function buildAvatar(isUser) {
+    const settings = store.state.uiSettings ?? {};
+    const url = isUser ? settings.avatarUser : settings.avatarAssistant;
+    const avatar = el("span", { class: `msg-avatar${isUser ? " is-user" : " is-assistant"}` });
+    if (url) {
+      avatar.appendChild(el("img", { src: String(url), alt: "" }));
+      return avatar;
+    }
+    if (isUser) {
+      avatar.appendChild(icon("user", { size: 15 }));
+      return avatar;
+    }
+    const initial = (assistantLabel() || "?").trim().charAt(0).toUpperCase();
+    avatar.appendChild(el("span", { class: "msg-avatar-fallback", text: initial || "AI" }));
+    return avatar;
+  }
 
   /** @param {any} meta 附件元数据（契约 upload 响应 / 富历史 attachments 项） */
   function buildAttachment(meta) {
@@ -179,7 +236,7 @@ export function createMessageFlow({ scrollEl, store, api, transport, t, onPinned
       } else if (msg.streaming) {
         open = active; // 流式：思考中自动展开、正文开始自动收起
       } else {
-        open = Boolean(store.state.showReasoningDefault);
+        open = Boolean(store.state.uiSettings?.showReasoningDefault ?? store.state.showReasoningDefault);
       }
       block.classList.toggle("is-open", open && Boolean(content));
       headState.textContent = msg.streaming && active
@@ -196,24 +253,38 @@ export function createMessageFlow({ scrollEl, store, api, transport, t, onPinned
    */
   function buildMessage(msg) {
     const isUser = msg.role === "user";
-    const wrap = el("div", { class: `msg ${isUser ? "is-user" : "is-assistant"}` });
-    const meta = el("div", { class: "msg-meta" },
-      el("span", { text: isUser ? t("msg.roleUser", "USER") : t("msg.roleAssistant", "AI") }),
-      hhmm(msg.ts) ? el("span", { text: hhmm(msg.ts) }) : null,
-    );
-    wrap.appendChild(meta);
+    const settings = store.state.uiSettings ?? {};
+    const showAvatars = Boolean(settings.showAvatars);
+    const wrap = el("div", { class: `msg ${isUser ? "is-user" : "is-assistant"}${showAvatars ? " has-avatars" : ""}` });
+    if (showAvatars) wrap.appendChild(buildAvatar(isUser));
+
+    const main = el("div", { class: "msg-main" });
+    wrap.appendChild(main);
+
+    // meta 行：角色标签（AI → 人格名）+ 可开关的时间戳
+    const metaChildren = [
+      el("span", { text: isUser ? userLabel() : assistantLabel() }),
+    ];
+    if (settings.showTimestamps !== false && hhmm(msg.ts)) {
+      metaChildren.push(el("span", { text: hhmm(msg.ts) }));
+    }
+    main.appendChild(el("div", { class: "msg-meta" }, metaChildren));
 
     if (isUser) {
-      if (msg.text) wrap.appendChild(el("div", { class: "msg-bubble", text: msg.text }));
+      if (msg.text) {
+        const bubble = el("div", { class: "msg-bubble" });
+        bubble.appendChild(renderMarkdown(msg.text));
+        main.appendChild(bubble);
+      }
       if (Array.isArray(msg.attachments) && msg.attachments.length > 0) {
-        wrap.appendChild(el("div", { class: "msg-attachments" }, ...msg.attachments.map(buildAttachment)));
+        main.appendChild(el("div", { class: "msg-attachments" }, ...msg.attachments.map(buildAttachment)));
       }
       return wrap;
     }
 
     // ── AI 卡片 ──
     const card = el("div", { class: "msg-card" });
-    wrap.appendChild(card);
+    main.appendChild(card);
     const streaming = Boolean(msg.streaming) || Boolean(msg.pendingPoll);
 
     // 思考区（流式占位始终渲染：空内容时隐藏，便于增量 patch）
@@ -221,14 +292,15 @@ export function createMessageFlow({ scrollEl, store, api, transport, t, onPinned
       card.appendChild(buildReasoning(msg).block);
     }
 
-    // 正文（流式增量只改这个 text node）
-    const textNode = document.createTextNode(msg.text ?? "");
+    // 正文（markdown 渲染；流式增量只改这个容器）
     const textCursor = el("span", {
       class: "breathe-cursor",
       style: { display: msg.textActive ? "" : "none" },
     });
+    const mdHost = el("div", { class: "msg-text" }, textCursor);
+    applyMarkdown(mdHost, msg.text ?? "", textCursor);
     if (msg.text || msg.streaming || msg.pendingPoll) {
-      card.appendChild(el("div", { class: "msg-text" }, textNode, textCursor));
+      card.appendChild(mdHost);
     }
 
     // 附件（v1.1：助手消息 attachments[] 与用户消息同构，渲染路径角色无关，
@@ -277,7 +349,8 @@ export function createMessageFlow({ scrollEl, store, api, transport, t, onPinned
       card.appendChild(panel);
     }
 
-    if (msg.usage) {
+    // usage 脚注（可在设置面板关闭）
+    if (msg.usage && settings.showUsage !== false) {
       card.appendChild(el("div", { class: "msg-usage", text: t("msg.usage", "TOKENS {out}/{total}")
         .replace("{out}", String(msg.usage.output ?? 0))
         .replace("{total}", String(msg.usage.total ?? 0)) }));
@@ -291,8 +364,9 @@ export function createMessageFlow({ scrollEl, store, api, transport, t, onPinned
         streamingRefs = {
           genId,
           msgId: msg.id,
-          textNode,
+          mdHost,
           cursor: textCursor,
+          latestText: String(msg.text ?? ""),
           reasoningWrap: /** @type {HTMLElement} */ (reasoningBlock),
           reasoningText: /** @type {Text} */ (reasoningBlock?.querySelector(".reasoning-text")?.firstChild ?? document.createTextNode("")),
           reasoningCursor: /** @type {HTMLElement} */ (reasoningBlock?.querySelector(".breathe-cursor")),
@@ -309,24 +383,12 @@ export function createMessageFlow({ scrollEl, store, api, transport, t, onPinned
 
   /* ── 空态 ───────────────────────────────────────────── */
 
+  /** 无会话空态（W4）：只提示暂无对话；发送即以宿主默认人格建会话，不再展示人格速选卡。 */
   function buildEmptyNoConversation() {
     return el("div", { class: "empty-state" },
       el("img", { src: "./assets/empty-state.svg", alt: "", class: "es-decoration" }),
-      el("div", { class: "es-kicker", text: t("empty.kicker", "SELECT PERSONA") }),
-      el("div", { class: "es-title", text: t("empty.title", "开始对话") }),
-      el("div", { class: "es-hint", text: t("empty.noConvoHint", "选择一个人格建立会话，然后发送消息即可开始。") }),
-      el("div", { class: "es-personas" },
-        ...store.state.personas.map((persona) => el("button", {
-          class: "es-persona-chip",
-          type: "button",
-          onclick: () => onPersonaPick(persona.id),
-        },
-          el("span", { class: "espc-name", text: persona.name ?? persona.id }),
-          persona.system_prompt_preview
-            ? el("span", { class: "espc-preview", text: persona.system_prompt_preview })
-            : null,
-        )),
-      ),
+      el("div", { class: "es-title", text: t("empty.noConvoTitle", "暂无对话") }),
+      el("div", { class: "es-hint", text: t("empty.noConvoHint", "在下方输入框发送消息，即以宿主默认人格开启会话。") }),
     );
   }
 
@@ -335,7 +397,6 @@ export function createMessageFlow({ scrollEl, store, api, transport, t, onPinned
     const personaName = store.personaOf(store.conversationOf(cid)?.persona_id)?.name ?? "";
     return el("div", { class: "empty-state" },
       el("img", { src: "./assets/empty-state.svg", alt: "", class: "es-decoration" }),
-      el("div", { class: "es-kicker", text: t("empty.kicker", "SELECT PERSONA") }),
       el("div", { class: "es-hint", text: t("empty.emptyConvoHint", "发送第一条消息，开始与「{persona}」的对话。")
         .replace("{persona}", personaName) }),
     );
@@ -344,6 +405,9 @@ export function createMessageFlow({ scrollEl, store, api, transport, t, onPinned
   /* ── 全量渲染 ───────────────────────────────────────── */
 
   function renderAll() {
+    window.clearTimeout(streamRenderTimer);
+    streamRenderTimer = 0;
+    streamRenderRefs = null;
     const cid = store.state.currentCid;
     const switched = cid !== currentCid;
     currentCid = cid;
@@ -386,6 +450,28 @@ export function createMessageFlow({ scrollEl, store, api, transport, t, onPinned
 
   /* ── 流式原位更新 ───────────────────────────────────── */
 
+  /**
+   * 正文 markdown 重渲染节流（W1 修订）：text_delta 高频到达时合并到
+   * 「最多每 100ms 一次」；尾帧用 setTimeout 兜底而非 rAF —— 实测后台/
+   * 受控标签页 rAF 整帧不触发，会让流式内容永远空白（终态 renderAll
+   * 是直渲染所以落定正常，但生成期间用户看不到任何文字）。
+   */
+  const STREAM_RENDER_MIN_INTERVAL = 100;
+  let streamRenderAt = 0;
+  let streamRenderTimer = 0;
+  /** @type {typeof streamingRefs} */
+  let streamRenderRefs = null;
+
+  function renderStreamNow() {
+    window.clearTimeout(streamRenderTimer);
+    streamRenderTimer = 0;
+    const refs = streamRenderRefs;
+    if (!refs) return;
+    streamRenderAt = Date.now();
+    applyMarkdown(refs.mdHost, refs.latestText, refs.cursor);
+    if (pinned) scrollToBottom();
+  }
+
   function patchStreaming() {
     const cid = store.state.currentCid;
     if (!cid) return;
@@ -397,9 +483,15 @@ export function createMessageFlow({ scrollEl, store, api, transport, t, onPinned
       return;
     }
     const refs = streamingRefs;
-    // 正文
-    refs.textNode.textContent = stream.text;
+    refs.latestText = stream.text;
     refs.cursor.style.display = stream.textActive ? "" : "none";
+    streamRenderRefs = refs;
+    const since = Date.now() - streamRenderAt;
+    if (since >= STREAM_RENDER_MIN_INTERVAL) {
+      renderStreamNow();
+    } else if (!streamRenderTimer) {
+      streamRenderTimer = window.setTimeout(renderStreamNow, STREAM_RENDER_MIN_INTERVAL - since);
+    }
     // 思考区
     if ((stream.reasoning || stream.reasoningActive) && refs.reasoningBlock) {
       const active = stream.reasoningActive;
