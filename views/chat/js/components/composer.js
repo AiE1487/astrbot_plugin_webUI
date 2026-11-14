@@ -2,6 +2,8 @@
  * composer.js — 输入区（M2 ④ / M3 ①②）。
  *
  * - 发送 → POST send 得 gen_id 即订阅（订阅在 store.sendMessage → streams.ensure）。
+ * - 发送按钮态仅在 updateButtons 刷新：输入/粘贴文本也必须触发（否则按钮停在旧态，
+ *   Enter 仍可用因 onSend 实时 canSend）。
  * - 停止 → POST stop/<gen_id> 后等 stopped 终态落 UI（契约：服务端先落终态再 cancel）。
  * - 409 双分支文案：session_busy / concurrency_limit。
  * - 附件：附件按钮 / 拖拽 / Ctrl+V 直接粘贴（W5）→ image/text 白名单过滤 →
@@ -528,7 +530,12 @@ export function createComposer({ root, store, api, t }) {
     textarea.style.height = "auto";
     textarea.style.height = `${Math.min(160, Math.max(42, textarea.scrollHeight))}px`;
   }
-  textarea.addEventListener("input", autoGrow);
+  // 输入必须重算按钮态：按钮 disabled 只在 updateButtons 里刷新，而输入框
+  // 从空到有字不经过任何 store 通知（曾靠切语言等 emit("ui") 顺带救活）
+  textarea.addEventListener("input", () => {
+    autoGrow();
+    updateButtons();
+  });
 
   /** 在光标处插入文本（图文混合粘贴时保留文字部分）。@param {string} text */
   function insertTextAtCursor(text) {
@@ -538,6 +545,7 @@ export function createComposer({ root, store, api, t }) {
     const pos = start + text.length;
     textarea.setSelectionRange(pos, pos);
     autoGrow();
+    updateButtons(); // 程序化改 value 不触发 input 事件，按钮态需手动重算
   }
 
   /* ── 装配 ───────────────────────────────────────────── */
