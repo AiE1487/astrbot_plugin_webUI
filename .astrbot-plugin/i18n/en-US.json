@@ -91,7 +91,7 @@
       "error.subscribeGone": "Generation stream not found or expired",
       "error.pollTimeout": "Timed out waiting for the reply; it may still be generating — refresh later",
       "login.title": "Standalone access",
-      "login.hint": "Enter the access password (empty password only allows localhost)",
+      "login.hint": "An access authorization code has been configured",
       "login.placeholder": "Access password",
       "login.submit": "Sign in",
       "login.checking": "Verifying…",

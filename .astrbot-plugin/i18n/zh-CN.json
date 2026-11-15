@@ -91,7 +91,7 @@
       "error.subscribeGone": "生成流不存在或已过期",
       "error.pollTimeout": "等待回复超时：生成可能仍在进行，稍后刷新查看",
       "login.title": "独立端口访问",
-      "login.hint": "请输入访问密码（独立入口鉴权；留空密码时仅本机可访问）",
+      "login.hint": "已配置访问授权码",
       "login.placeholder": "访问密码",
       "login.submit": "进入",
       "login.checking": "验证中…",

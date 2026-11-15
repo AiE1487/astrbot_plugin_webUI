@@ -30,7 +30,7 @@ import { createMockTransport } from "./mock.js";
 
 /** 与 metadata.yaml version 保持一致（加载屏/侧栏脚注显示用）。 */
 export const PLUGIN_NAME = "astrbot_plugin_webui";
-export const PLUGIN_VERSION = "0.3.4";
+export const PLUGIN_VERSION = "0.3.5";
 
 const CHANNEL = "astrbot-plugin-page";
 const READY_TIMEOUT = 4000;
@@ -177,7 +177,7 @@ const TRANSLATIONS = {
     "error.subscribeGone": "生成流不存在或已过期",
     "error.pollTimeout": "等待回复超时：生成可能仍在进行，稍后刷新查看",
     "login.title": "独立端口访问",
-    "login.hint": "请输入访问密码（独立入口鉴权；留空密码时仅本机可访问）",
+    "login.hint": "已配置访问授权码",
     "login.placeholder": "访问密码",
     "login.submit": "进入",
     "login.checking": "验证中…",
@@ -284,7 +284,7 @@ const TRANSLATIONS = {
     "error.subscribeGone": "Generation stream not found or expired",
     "error.pollTimeout": "Timed out waiting for the reply; it may still be generating — refresh later",
     "login.title": "Standalone access",
-    "login.hint": "Enter the access password (empty password only allows localhost)",
+    "login.hint": "An access authorization code has been configured",
     "login.placeholder": "Access password",
     "login.submit": "Sign in",
     "login.checking": "Verifying…",

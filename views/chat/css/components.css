@@ -1140,7 +1140,15 @@
   text-align: center;
 }
 
+.login-card form {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+}
+
 .login-card input[type="password"] {
+  width: min(240px, 100%);
   height: 40px;
   padding: 0 12px;
   background: var(--bg-item);
@@ -1159,9 +1167,11 @@
   font-size: 12px;
   color: var(--error);
   min-height: 16px;
+  text-align: center;
 }
 
 .login-card .btn-primary {
+  width: min(240px, 100%);
   height: 40px;
 }
 

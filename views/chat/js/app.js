@@ -331,7 +331,7 @@ async function boot() {
         el("img", { src: "./assets/logo-mark.svg", alt: "" }),
         el("div", { class: "lc-title", text: t("login.title", "独立端口访问") }),
       ),
-      el("div", { class: "lc-hint", text: t("login.hint", "请输入访问密码（独立入口鉴权；留空密码时仅本机可访问）") }),
+      el("div", { class: "lc-hint", text: t("login.hint", "已配置访问授权码") }),
       form,
       el("div", { class: "lc-foot", text: `${PLUGIN_NAME} // v${transport.version}` }),
     );
