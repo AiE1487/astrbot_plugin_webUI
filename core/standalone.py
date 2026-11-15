@@ -50,6 +50,7 @@ _TOKENS: set[str] = set()
 # 与 routes.register_routes 的精确路径一一对应；动态段 <name> 编译为单段 [^/]+
 _API_ROUTES: tuple[tuple[str, str, str], ...] = (
     ("GET", r"health", "handle_health"),
+    ("GET", r"config", "handle_get_config"),
     ("GET", r"personas", "handle_personas"),
     ("GET", r"conversations", "handle_list_conversations"),
     ("POST", r"conversations", "handle_create_conversation"),

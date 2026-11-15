@@ -17,9 +17,10 @@
 from pathlib import Path
 
 from astrbot.api import AstrBotConfig, logger
+from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star
 
-from .core import attachment_service, chat_service
+from .core import attachment_service, chat_service, pipeline_bridge
 from .core.routes import PLUGIN_NAME, register_routes
 from .core.standalone import start as standalone_start, stop as standalone_stop
 
@@ -124,6 +125,17 @@ class WebUIPlugin(Star):
                 "（WebUI → 插件管理 → 本插件 → 打开「对话」视图），"
                 "或开启配置后重载插件"
             )
+
+    @filter.platform_adapter_type(filter.PlatformAdapterType.WEBCHAT)
+    async def apply_user_identity(self, event: AstrMessageEvent) -> None:
+        """用户识别联动（webchat 平台事件监听，ProcessStage 于 LLM 请求前触发）。
+
+        宿主开启「用户识别」（provider_settings.identifier）时，把插件命名空间
+        事件的 sender 身份改写为配置的用户显示名（user_display_name），模型由此
+        获知用户身份；不 yield、不停事件，对话流程与未注册时一致。逻辑与降级
+        语义见 core/pipeline_bridge.apply_sender_identity。
+        """
+        pipeline_bridge.apply_sender_identity(self, event)
 
     async def terminate(self) -> None:
         """插件被停用/重载/卸载时调用：清理孤儿清理任务、全部生成任务与自持资源。"""

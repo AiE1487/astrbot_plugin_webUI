@@ -282,6 +282,20 @@ export function createApi(transport) {
     }
   }
 
+  /**
+   * GET config → {user_display_name} —— 插件展示配置（用户消息显示名）。
+   * mock / 旧版后端无此端点时抛 ApiError(404)，调用方按「沿用默认 USER」降级。
+   * @returns {Promise<{user_display_name: string} | null>}
+   */
+  async function getConfig() {
+    try {
+      const data = await transport.apiGet("config", {});
+      return data && typeof data === "object" ? data : null;
+    } catch (error) {
+      throw normalizeError(error);
+    }
+  }
+
   return {
     health,
     listPersonas,
@@ -294,6 +308,7 @@ export function createApi(transport) {
     upload,
     downloadFile,
     mediaUrl,
+    getConfig,
     getUiSettings,
     saveUiSettings,
   };

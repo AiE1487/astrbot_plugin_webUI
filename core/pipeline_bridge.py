@@ -394,6 +394,59 @@ def remove_back_queue(gen_id: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# 用户识别联动（provider_settings.identifier）
+# ---------------------------------------------------------------------------
+
+
+def apply_sender_identity(plugin, event) -> None:
+    """用户识别联动：把配置的用户名写入插件命名空间 webchat 事件的 sender 身份。
+
+    宿主构建 LLM 请求时若 ``provider_settings.identifier``（用户识别）开启，会把
+    ``event.message_obj.sender`` 的 user_id / nickname 前缀进系统提示
+    （astr_main_agent.py:999-1002 ``_append_system_reminders`` 实源）。webchat
+    适配器从队列 tuple 首元素同时派生 sender 与 session_id/umo
+    （webchat_adapter.py ``convert_message`` 实源），二者在宿主侧硬绑定，因此
+    不能直接改注入 creator（会搬家会话命名空间、断掉既有绑定）——改由管线
+    ProcessStage 事件处理器（main.py ``@filter.platform_adapter_type(WEBCHAT)``）
+    在 LLM 请求构建前调用本函数，仅改写插件命名空间事件的 sender 两个字段：
+    session_id / umo / 会话绑定不动，官方会话页事件经 ``parse_umo`` 门控排除。
+
+    调用约定：handler 不 yield、不停事件，LLM 流程与未注册时完全一致。
+
+    Args:
+        plugin: 插件实例（读 ``config["user_display_name"]`` 与宿主全局配置）。
+        event: 宿主 AstrMessageEvent（仅 webchat 平台事件会进入）。
+
+    Notes:
+        - 宿主侧 ``identifier`` 每事件实时读取（``context.get_config()`` 即全局
+          配置，与 ``_append_system_reminders`` 的主源 ``config.provider_settings``
+          同源）；桩环境/宿主缺失时静默跳过（联动是增量功能，不阻塞对话）。
+        - Dashboard 登录名恰为 ``astrbot_plugin_webui`` 的极端场景会命中本插件
+          命名空间（可忽略；官方 sender 本就是该登录名，改写无实害）。
+    """
+    try:
+        if not plugin.context.get_config().get("provider_settings", {}).get(
+            "identifier"
+        ):
+            return
+    except Exception:  # noqa: BLE001 —— 桩环境/宿主缺失：联动降级为无操作
+        return
+    if parse_umo(event.unified_msg_origin) is None:
+        return  # 官方会话页等其他 webchat 事件不动
+    try:
+        name = str(plugin.config["user_display_name"]).strip()
+    except Exception:  # noqa: BLE001 —— 配置缺失（旧版本数据）按空名处理
+        name = ""
+    if not name:
+        return
+    sender = getattr(event.message_obj, "sender", None)
+    if sender is None:
+        return
+    sender.user_id = name
+    sender.nickname = name
+
+
+# ---------------------------------------------------------------------------
 # back_queue 排水 + SSE 翻译（§0.2 翻译表）
 # ---------------------------------------------------------------------------
 

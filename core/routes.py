@@ -6,6 +6,7 @@
 （standalone.py）挂同路径的同款 handler）::
 
     GET    health                    连通性探测
+    GET    config                    前端展示配置（user_display_name）
     GET    personas                  人格列表（id、名称、system_prompt 摘要、工具、默认）
     GET    conversations             会话列表（cid、title、persona_id、updated_at、busy、legacy?）
     POST   conversations             新建 {persona_id, title?} -> {cid}
@@ -183,6 +184,7 @@ def register_routes(plugin: Star) -> None:
         context.register_web_api(f"/{PLUGIN_NAME}/{route}", view, methods, desc)
 
     _reg("health", ["GET"], "连通性探测", handle_health)
+    _reg("config", ["GET"], "前端展示配置（用户显示名等）", handle_get_config)
     _reg("personas", ["GET"], "人格列表", handle_personas)
     _reg("conversations", ["GET"], "会话列表", handle_list_conversations)
     _reg("conversations", ["POST"], "新建会话", handle_create_conversation)
@@ -209,6 +211,16 @@ async def handle_health(plugin: Star):
     return json_response(
         {"status": "ok", "plugin": PLUGIN_NAME, "version": await _plugin_version(plugin)}
     )
+
+
+@_endpoint
+async def handle_get_config(plugin: Star):
+    """GET config —— 前端展示配置（非敏感子集，随配置面板实时变化）。
+
+    仅透出展示用字段：``user_display_name``（用户消息显示名，默认 USER）。
+    独立端口与内嵌视图共用；前端启动时装载，改动后刷新页面生效。
+    """
+    return json_response({"user_display_name": str(plugin.config["user_display_name"])})
 
 
 @_endpoint

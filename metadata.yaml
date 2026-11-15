@@ -5,7 +5,7 @@ desc: 在 AstrBot WebUI 中提供类 SillyTavern（酒馆）风格的对话视�
   思考与工具调用展示、附件对话；Dashboard 内嵌视图与独立端口页双入口，单用户共享会话池。
   插件只做前端与传输，对话全托管宿主管道（webchat 队列注入 + back_queue 消费），
   工具调用、记忆、RAG 等管道插件照常生效。
-version: v0.3.5
+version: v0.3.6
 author: AiE1487
 repo: https://github.com/AiE1487/astrbot_plugin_webUI
 astrbot_version: ">=4.29,<5"

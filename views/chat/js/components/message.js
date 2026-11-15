@@ -135,9 +135,9 @@ export function createMessageFlow({ scrollEl, store, api, transport, t, onPinned
     return store.personaOf(convo?.persona_id)?.name ?? t("msg.roleAssistant", "AI");
   }
 
-  /** 用户展示名（meta 行）。 */
+  /** 用户展示名（meta 行）：插件配置 user_display_name 优先，空回退 i18n 默认 USER。 */
   function userLabel() {
-    return t("msg.roleUser", "USER");
+    return String(store.state.userDisplayName ?? "").trim() || t("msg.roleUser", "USER");
   }
 
   /**

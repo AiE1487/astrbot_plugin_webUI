@@ -633,6 +633,42 @@ async def _test_conversation_service() -> None:
     check("C5 非插件 creator 前缀拒绝", pipeline_bridge.parse_umo("webchat:FriendMessage:webchat!otheruser!x") is None)
     check("C6 残缺 umo 拒绝", pipeline_bridge.parse_umo("webchat") is None and pipeline_bridge.parse_umo("") is None)
 
+    # 用户识别联动（v0.3.6 apply_sender_identity）：仅 identifier 开启时改写插件命名空间 sender
+    ident_plugin = make_plugin(fresh_sandbox())
+
+    def _ident_sender():
+        return SimpleNamespace(user_id="astrbot_plugin_webui", nickname="astrbot_plugin_webui")
+
+    def _ident_event(sender, umo_arg=None):
+        return SimpleNamespace(
+            unified_msg_origin=umo_arg if umo_arg is not None else umo,
+            message_obj=SimpleNamespace(sender=sender),
+        )
+
+    ident_plugin.context.get_config = lambda: {"provider_settings": {"identifier": False}}
+    sender = _ident_sender()
+    pipeline_bridge.apply_sender_identity(ident_plugin, _ident_event(sender))
+    check("C6a identifier 关不改写", sender.user_id == "astrbot_plugin_webui" and sender.nickname == "astrbot_plugin_webui", f"{sender.user_id}/{sender.nickname}")
+    ident_plugin.context.get_config = lambda: {"provider_settings": {"identifier": True}}
+    pipeline_bridge.apply_sender_identity(ident_plugin, _ident_event(sender))
+    check("C6b identifier 开改写为配置名（schema 默认 USER）", sender.user_id == "USER" and sender.nickname == "USER", f"{sender.user_id}/{sender.nickname}")
+    ident_plugin.config["user_display_name"] = "  泡泡  "
+    sender = _ident_sender()
+    pipeline_bridge.apply_sender_identity(ident_plugin, _ident_event(sender))
+    check("C6c 配置名去首尾空白", sender.user_id == "泡泡" and sender.nickname == "泡泡", f"{sender.user_id}/{sender.nickname}")
+    sender = _ident_sender()
+    pipeline_bridge.apply_sender_identity(ident_plugin, _ident_event(sender, umo_arg="webchat:FriendMessage:webchat!otheruser!x"))
+    check("C6d 官方会话页命名空间不改写", sender.user_id == "astrbot_plugin_webui" and sender.nickname == "astrbot_plugin_webui", f"{sender.user_id}/{sender.nickname}")
+    ident_plugin.config["user_display_name"] = "   "
+    sender = _ident_sender()
+    pipeline_bridge.apply_sender_identity(ident_plugin, _ident_event(sender))
+    check("C6e 空白名不改写", sender.user_id == "astrbot_plugin_webui" and sender.nickname == "astrbot_plugin_webui", f"{sender.user_id}/{sender.nickname}")
+    ident_plugin.config["user_display_name"] = "USER"
+    bare_plugin = make_plugin(fresh_sandbox())  # FakeContext 默认无 get_config → 桩降级
+    sender = _ident_sender()
+    pipeline_bridge.apply_sender_identity(bare_plugin, _ident_event(sender))
+    check("C6f 桩环境无 get_config 降级不改写", sender.user_id == "astrbot_plugin_webui" and sender.nickname == "astrbot_plugin_webui", f"{sender.user_id}/{sender.nickname}")
+
     sandbox = fresh_sandbox()
     plugin = make_plugin(sandbox)
     context = plugin.context
@@ -1456,6 +1492,8 @@ async def _test_standalone_logic() -> None:
     post_match = [name for m, pat, name in standalone._API_ROUTES if m == "POST" and _re.fullmatch(pat, "ui/settings")]
     check("L-21 GET ui/settings 入表", get_match == ["handle_get_ui_settings"], str(get_match))
     check("L-22 POST ui/settings 入表", post_match == ["handle_post_ui_settings"], str(post_match))
+    config_match = [name for m, pat, name in standalone._API_ROUTES if m == "GET" and _re.fullmatch(pat, "config")]
+    check("L-23 GET config 入表（v0.3.6）", config_match == ["handle_get_config"], str(config_match))
 
 
 # ---------------------------------------------------------------------------
@@ -1479,6 +1517,7 @@ def test_routes() -> None:
 
     expected = {
         "/astrbot_plugin_webui/health": ["GET"],
+        "/astrbot_plugin_webui/config": ["GET"],
         "/astrbot_plugin_webui/personas": ["GET"],
         "/astrbot_plugin_webui/conversations": ["GET", "POST"],
         "/astrbot_plugin_webui/conversations/<cid>": ["DELETE"],
@@ -1646,6 +1685,15 @@ def test_routes() -> None:
         stub_request.set_json({"compact": False})
         resp = await call("/astrbot_plugin_webui/ui/settings", "POST")
         check("E49 头像键缺省按空串处理", resp["status"] == 200 and resp["data"]["settings"]["avatarUser"] == "" and resp["data"]["settings"]["compact"] is False)
+
+        # ── v0.3.6 展示配置端点（GET config → user_display_name，实时读配置） ──
+        stub_request.set_json(None)
+        resp = await call("/astrbot_plugin_webui/config", "GET")
+        check("E50 GET config 默认 USER", resp["status"] == 200 and resp["data"]["user_display_name"] == "USER", str(resp))
+        plugin.config["user_display_name"] = "泡泡"
+        resp = await call("/astrbot_plugin_webui/config", "GET")
+        check("E51 GET config 实时读配置", resp["status"] == 200 and resp["data"]["user_display_name"] == "泡泡", str(resp))
+        plugin.config["user_display_name"] = "USER"
 
     asyncio.run(_run())
 

@@ -1,5 +1,26 @@
 # 更新日志
 
+## v0.3.6（2026-11-15）
+
+用户显示名可自定义 + 宿主「用户识别」联动（前后端，1 新端点）。
+
+- **新配置** `user_display_name`（string，默认 `USER`）：对话界面用户消息的
+  显示名。前端经新增 `GET config` 端点装载（内嵌/独立端口共用，routes.py +
+  standalone `_API_ROUTES` 各入一条；启动时拉取，改动后刷新页面生效）。
+- **用户识别联动**：宿主 `provider_settings.identifier`（用户识别）开启时，
+  插件命名空间 webchat 事件的 sender 身份被改写为配置名，随宿主
+  `_append_system_reminders` 前缀进系统提示（"User ID: <名字>, Nickname:
+  <名字>"），模型由此识别用户身份。实现为 main.py
+  `@filter.platform_adapter_type(WEBCHAT)` 事件监听（ProcessStage 先于 LLM
+  请求执行，不 yield 不停事件），核心逻辑在
+  `pipeline_bridge.apply_sender_identity`（parse_umo 门控 + 桩环境降级）。
+  **不改注入 creator**——宿主 webchat 适配器从队列 tuple 首元素同时派生
+  sender 与 session_id/umo（webchat_adapter.py convert_message 实源），改
+  creator 会搬家会话命名空间、断掉既有绑定，故走事件监听改写 sender 两字段。
+- **i18n**：`msg.roleUser`（"USER"）保留为前端回退默认；配置名为空时回退。
+- selftest 新增 9 项断言（C6a–f 联动语义 / E50–51 GET config / L-23 独立
+  端口路由表），共 323 项。
+
 ## v0.3.5（2026-11-15）
 
 独立端口登录卡的文案与表单布局微调（纯前端，无逻辑改动）。

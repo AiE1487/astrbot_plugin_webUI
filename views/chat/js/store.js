@@ -153,6 +153,7 @@ export function createStore({ api, transport, t }) {
     switchTick: 0, // 会话切换动画标记（每次切换 +1，组件据此重播动画）
     bannerGone: false, // 流 404/过期横幅
     showReasoningDefault: false,
+    userDisplayName: /** @type {string} */ (""), // 用户消息显示名（GET config；空回退 i18n USER）
     uiSettings: { ...UI_SETTINGS_DEFAULTS },
     lastError: /** @type {{kind: string, message: string}|null} */ (null),
   };
@@ -197,6 +198,18 @@ export function createStore({ api, transport, t }) {
       }
     } catch {
       /* mock / 旧版后端无此端点 → 沿用本地设置 */
+    }
+  }
+
+  /** @returns {Promise<void>} 拉取插件展示配置（用户显示名；失败静默回退 i18n）。 */
+  async function pullRemoteConfig() {
+    try {
+      const config = await api.getConfig();
+      if (config && typeof config.user_display_name === "string") {
+        state.userDisplayName = config.user_display_name;
+      }
+    } catch {
+      /* mock / 旧版后端无此端点 → 沿用 i18n 默认 USER */
     }
   }
 
@@ -862,11 +875,12 @@ export function createStore({ api, transport, t }) {
     loadConversations,
     loadInitial: async () => {
       loadActiveGens();
-      // 宿主侧 UI 设置（含头像）与人格/会话并行拉取；首条消息渲染前完成合并
+      // 宿主侧 UI 设置（含头像）、展示配置与人格/会话并行拉取；首条消息渲染前完成合并
       const remoteSettingsTask = pullRemoteUiSettings();
+      const remoteConfigTask = pullRemoteConfig();
       await loadPersonas();
       await loadConversations();
-      await remoteSettingsTask;
+      await Promise.all([remoteSettingsTask, remoteConfigTask]);
       // 恢复上次会话，否则取最新一条
       const stored = safeStorage.get(KEY_CURRENT_CID);
       const initial = (stored && state.conversations.some((item) => item.cid === stored))

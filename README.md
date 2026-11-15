@@ -101,6 +101,7 @@
 | `upload_image_max_mb` | int | `20` | 单张图片上传上限（MB），超限拒收 |
 | `upload_text_max_kb` | int | `200` | 单个文本附件生成预览的内容上限（KB），超出部分截断提示（附件内容随消息交宿主管道处理） |
 | `show_reasoning_default` | bool | `false` | 历史消息里的思考内容默认展开还是折叠 |
+| `user_display_name` | string | `USER` | 对话界面里用户消息的显示名称；若宿主开启「用户识别」（provider_settings.identifier），该名称同时作为用户 ID 随对话注入管道供模型识别身份（界面显示刷新页面后生效） |
 | `attachment_text_whitelist` | list | `txt, md, json, csv, py` | 允许作为文本附件的后缀白名单 |
 
 ## ❓ 常见问题
