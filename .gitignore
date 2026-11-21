@@ -11,3 +11,6 @@ dist/
 # 参考源码与本地工具（不跟踪；打包脚本不读 .gitignore，打包前需临时移出 .astrbot-src/）
 .astrbot-src/
 .zcode/
+
+# Agent 指令文件（仅本地维护，不入库；打包脚本已排除）
+AGENTS.md
