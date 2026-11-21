@@ -10,7 +10,9 @@
  * - busy 会话禁发（M2 ②）；流式中收到 error.code=model_not_multimodal 标记消息失败。
  * - 合并队列（按 cid）：busy 期间经 composer 并入的待合并消息，
  *   viewMessages 合成为 queued:true 的用户消息上屏，下一轮发送时合并发出。
- * - 上下文统计（stats 事件）按 cid 保留至该会话下次生成（终态不清理）。
+ * - 上下文统计（stats 事件）按 cid 保留至该会话下次生成（终态不清理）；
+ *   历史页1加载/降级轮询落定时用最后一条带 stats 的 assistant 消息恢复，
+ *   内存已有 live 值时不覆盖——统计栏常驻（无数据由 composer 渲染 "--" 占位）。
  * - 通知采用 topic 批处理（微任务合并），组件按 topic 粒度重渲染；
  *   增量渲染合并 DOM 写入（text_delta 只增改流式消息的文本节点）。
  *
@@ -81,6 +83,10 @@ function normalizeMessage(raw) {
     usage: raw?.usage && typeof raw.usage === "object"
       ? { output: Number(raw.usage.output ?? 0), total: Number(raw.usage.total ?? 0) }
       : null,
+    // stats 原样透传（cache_rate 为 null 时 Number() 会塌成 0，不得逐字段强转）
+    stats: raw?.stats && typeof raw.stats === "object" && !Array.isArray(raw.stats)
+      ? { ...raw.stats }
+      : null,
     error: raw?.error ? String(raw.error) : null,
     // 失败分类：后端占位写 error_code（下划线），本地流式终态写 errorCode（驼峰）
     errorCode: String(raw?.errorCode ?? raw?.error_code ?? ""),
@@ -147,7 +153,8 @@ export function createStore({ api, transport, t }) {
   /** 合并队列（T1）：cid → [{text, attachments}]，busy 排队场景，下一轮发送时合并发出。 */
   /** @type {Map<string, Array<{text: string, attachments: any[]}>>} */
   const queuedByCid = new Map();
-  /** 上下文统计（T4）：cid → 最近一次 stats 事件负载；终态不清理，保留到下次生成。 */
+  /** 上下文统计（T4）：cid → 最近一次 stats 事件负载；终态不清理，保留到下次生成。
+   *  历史加载经 seedStatsFromHistory 恢复（常驻统计栏数据源）。 */
   /** @type {Map<string, Record<string, any>>} */
   const statsByCid = new Map();
 
@@ -557,6 +564,27 @@ export function createStore({ api, transport, t }) {
     return entry;
   }
 
+  /**
+   * 统计栏常驻恢复：取 messages 中最后一条带 stats 的 assistant 消息写入
+   * statsByCid（后端自 v0.4.2 起在历史 bot 行附带最近一次 stats）。
+   * 默认仅在内存尚无该会话统计时写入——切会话/刷新时保留流中已到的较新
+   * live 值；降级轮询路径传 force（该模式无 SSE，seeding 是唯一写入方），
+   * 每次落定后都能刷新到最新统计。无可恢复项时不动既有值。
+   * @param {string} cid
+   * @param {Array<any>} messages
+   * @param {{force?: boolean}} [options]
+   */
+  function seedStatsFromHistory(cid, messages, { force = false } = {}) {
+    if (!force && statsByCid.has(cid)) return;
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+      const stats = messages[i]?.stats;
+      if (stats && typeof stats === "object") {
+        statsByCid.set(cid, { ...stats });
+        return;
+      }
+    }
+  }
+
   /** @param {string} cid @param {number} page */
   async function fetchHistoryPage(cid, page) {
     const entry = ensureHistory(cid);
@@ -569,6 +597,7 @@ export function createStore({ api, transport, t }) {
       if (page <= 1) {
         entry.messages = incoming;
         entry.page = data.page || 1;
+        seedStatsFromHistory(cid, incoming); // 常驻统计：页1含最新消息，恢复最近统计
       } else {
         // 向上 prepend 更早一页（页内旧→新，直接整页插到头部）
         entry.messages = [...incoming, ...entry.messages];
@@ -776,6 +805,7 @@ export function createStore({ api, transport, t }) {
             entry.total = data.total;
             entry.hasMore = data.hasMore;
             entry.loaded = true;
+            seedStatsFromHistory(cid, data.messages, { force: true }); // 常驻统计：降级路径唯一写入方
             clearActiveGen(cid); // 回复已落定，清活跃 gen（停止按钮随之切回发送）
             emit("messages");
             refreshConversationsSoon();

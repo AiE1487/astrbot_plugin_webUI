@@ -1,5 +1,24 @@
 # 更新日志
 
+## v0.4.2（2026-11-21）
+
+统计栏常驻：缓存命中率/上下文用量不再「发消息后才出现」，刷新/切会话后恢复最近一次统计。
+
+- **统计栏常驻渲染**（composer）：`.stats-bar` 两项恒渲染，无数据（新会话/
+  agent_stats 缺省/cache_rate=null，`Number(null)` 会塌成 0 故先判空）以
+  "--" 占位（「缓存 --」「上下文 --」）；移除 `.stats-bar:empty` 空态隐藏。
+  此前 stats 仅由生成期 SSE 事件写入前端内存，刷新/切会话后 statsOf 为空 →
+  栏清空 + `:empty` 隐藏，故只在发消息后可见。
+- **历史统计恢复**：后端历史 bot 行附带 `stats` 字段（conversation_service
+  复用 `stats_from_agent_stats`，agent_stats 缺失的 v0.4.0 前旧行/非 LLM
+  回复不造值）；前端 normalizeMessage 白名单透传 stats，页1历史加载用最后
+  一条带 stats 的 assistant 消息恢复 statsByCid（内存已有 live 值时不覆盖，
+  流中较新值优先），降级轮询落定路径 force 覆盖（该模式无 SSE，seeding 是
+  唯一写入方）。
+- **mock 同构**：mock 历史（c1/c2）与流式落定消息补 stats，c2 演示
+  cache_rate=null 的「缓存 --」占位；getHistory 透传。
+- 自测 343 项断言全过（新增 C20-1 历史 stats 映射）。
+
 ## v0.4.1（2026-11-21）
 
 修复附件预览破图（composer 把 text 附件的 preview 内容摘要当图片 URL 渲染）。

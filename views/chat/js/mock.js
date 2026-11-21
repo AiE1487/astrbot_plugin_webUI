@@ -12,12 +12,12 @@
  * - 400/404：send 校验、未知 cid/gen_id
  * - upload：图片 canvas 压缩预览（≤256px data URL）、文本前 500 字摘要、
  *   >200KB 截断 truncated=true、图片 >20MB 413、类型不在白名单 415
- * - 富历史：attachments/reasoning/tools/usage/error 字段齐全；page=1 最新一页、
+ * - 富历史：attachments/reasoning/tools/usage/stats/error 字段齐全；page=1 最新一页、
  *   页内旧→新、has_more；首条用户消息后标题改为其前 20 字
  * - media/stats 事件（T4）：正常流各发一次——media（流中附件 meta，f_mock1，
  *   preview 直出 data URL，置于正文流式前便于观察）在正文前、stats（上下文
- *   统计 cache_rate/context_tokens/max=null）在终态前；终态消息 attachments
- *   落历史，done 重建后附件仍可见
+ *   统计 cache_rate/context_tokens/max=null）在终态前；终态消息 attachments/stats
+ *   落历史，done 重建后附件仍可见、统计栏常驻恢复
  * - GET conversations 项带 gen_id（REST 契约：busy 时为进行中 gen_id，否则 null），
  *   供前端 T2 会话列表兜底恢复订阅演示
  *
@@ -207,6 +207,8 @@ function seedDatasets() {
       content: "用户给了一张会议相关的图和一份笔记。需要：1) 确认收到两张图片；2) 逐条整理笔记为纪要；3) 保持简洁并列出可执行的下一步。",
     },
     usage: { output: 96, total: 512 },
+    // 历史携带最近一次 stats（与真后端 v0.4.2 起一致，供常驻统计栏恢复）
+    stats: { cache_rate: 0.62, context_tokens: 512, max_context_tokens: null, input_cached: 282, input_other: 173, output: 96 },
   });
   // W1：markdown 渲染演示消息（标题/列表/代码块/表格/引用全覆盖，供视觉验收）
   hist1.push({
@@ -237,6 +239,7 @@ function seedDatasets() {
       "> 引用块：酒馆风 UI，深色底 + 青色锚线。",
     ].join("\n"),
     usage: { output: 210, total: 1240 },
+    stats: { cache_rate: 0.87, context_tokens: 12400, max_context_tokens: null, input_cached: 10788, input_other: 1612, output: 210 },
   });
   histories.set(c1, hist1);
 
@@ -253,6 +256,7 @@ function seedDatasets() {
         { id: `call_${uuidHex().slice(0, 8)}`, name: "get_weather", args: { location: "上海" }, error: "tool timeout after 5000ms", elapsed_ms: 5003 },
       ],
       usage: { output: 48, total: 620 },
+      stats: { cache_rate: null, context_tokens: 620, max_context_tokens: null, input_cached: 0, input_other: 620, output: 48 },
     },
   ]);
 
@@ -530,6 +534,15 @@ export function createMockTransport() {
         }];
       }
       assistant.usage = { output: Math.max(1, Math.floor(reply.length / 2)), total: 800 };
+      // 历史携带 stats（与流中 stats 事件同值，真后端 v0.4.2 起同构：常驻统计栏刷新恢复）
+      assistant.stats = {
+        cache_rate: 0.87,
+        context_tokens: 12400,
+        max_context_tokens: null,
+        input_cached: 10788,
+        input_other: 1612,
+        output: 512,
+      };
       // media 事件附件同步落历史（与真后端一致：终态消息携带流中附件，
       // done 重建后附件仍可见，预览不至于只在毫秒级窗口闪现）
       assistant.attachments = [mediaEventAttachment()];

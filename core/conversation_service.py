@@ -334,6 +334,11 @@ async def _map_platform_row(row, data_dir) -> dict | None:
         usage = _usage_from_content(content)
         if usage:
             message["usage"] = usage
+        # 统计栏常驻：历史 bot 行携带最近一次 stats（与 live stats 事件同载荷形状），
+        # 前端按会话恢复最近统计；agent_stats 缺失（v0.4.0 前旧行/非 LLM 回复）不造值
+        agent_stats = content.get("agent_stats")
+        if isinstance(agent_stats, dict) and agent_stats:
+            message["stats"] = pipeline_bridge.stats_from_agent_stats(agent_stats)
     return message
 
 

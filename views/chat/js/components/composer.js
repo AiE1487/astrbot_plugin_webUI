@@ -10,7 +10,8 @@
  *   队列（store.queueMessage）；发送时把队列各项 + 当前输入拼成一条消息一次发出
  *   （sendMessage 签名不变，合并发生在 composer 组装层），成功后清空队列。
  * - 统计栏（T4）：composer-inner 顶部 stats-bar，按 store.statsOf(当前 cid)
- *   渲染缓存命中率与上下文用量（stats 事件驱动；无数据留空）。
+ *   渲染缓存命中率与上下文用量（stats 事件 / 历史恢复驱动；常驻栏位，
+ *   无数据以 "--" 占位，不再空态隐藏）。
  * - 附件：附件按钮 / 拖拽 / Ctrl+V 直接粘贴（W5）→ image/text 白名单过滤 →
  *   图片 canvas 压缩长边≤2048 再 upload（toBlob 异步完成后再提交 FormData）→
  *   预览条（缩略图/文件卡 + 可移除）→ 发送携 file_ids；upload 413/415 立即提示并阻断；
@@ -119,7 +120,7 @@ export function createComposer({ root, store, api, t }) {
   const pending = new Map();
   const previewBar = el("div", { class: "attach-preview", "aria-label": "attachments" });
 
-  // 统计栏（T4）：stats 事件驱动，按当前会话渲染缓存命中率/上下文用量；无数据留空
+  // 统计栏（T4）：stats 事件驱动，按当前会话渲染缓存命中率/上下文用量；常驻，无数据 "--" 占位
   const statsBar = el("div", { class: "stats-bar" });
 
   function refreshPreviewBar() {
@@ -648,32 +649,34 @@ export function createComposer({ root, store, api, t }) {
     return String(Math.round(n));
   }
 
-  /** 按当前会话渲染统计栏（stats 事件 / 会话切换驱动）；无数据留空。 */
+  /** 按当前会话渲染统计栏（stats 事件 / 会话切换驱动）。常驻栏位：两项恒在，
+   *  无数据（新会话/agent_stats 缺省/cache_rate=null）时以 "--" 占位。 */
   function renderStats() {
     const cid = store.state.currentCid;
     const stats = cid ? store.statsOf(cid) : null;
+    const valid = stats !== null && typeof stats === "object";
     statsBar.replaceChildren();
-    if (!stats || typeof stats !== "object") return;
-    // 缓存命中率：cache_rate null/缺省 → 该项隐藏
-    const cacheRate = stats.cache_rate;
-    if (cacheRate !== null && cacheRate !== undefined && Number.isFinite(Number(cacheRate))) {
-      const pct = `${Math.round(Number(cacheRate) * 100)}%`;
-      statsBar.appendChild(el("span", {
-        class: "sb-item sb-cache",
-        text: t("stats.cache", "缓存 {pct}").replace("{pct}", pct),
-      }));
-    }
-    // 上下文用量：有 max_context_tokens 用 {used}/{max}，否则仅 {used}
-    const contextTokens = stats.context_tokens;
-    if (contextTokens !== null && contextTokens !== undefined && Number.isFinite(Number(contextTokens))) {
-      const maxTokens = stats.max_context_tokens;
-      const label = (maxTokens !== null && maxTokens !== undefined && Number.isFinite(Number(maxTokens)) && Number(maxTokens) > 0)
-        ? t("stats.context", "上下文 {used}/{max}")
-          .replace("{used}", fmtTokens(contextTokens))
-          .replace("{max}", fmtTokens(maxTokens))
-        : t("stats.contextNoMax", "上下文 {used}").replace("{used}", fmtTokens(contextTokens));
-      statsBar.appendChild(el("span", { class: "sb-item sb-ctx", text: label }));
-    }
+    // 缓存命中率：cache_rate null/缺省/非数值 → "--"（分母 0 = provider 未上报缓存；
+    // Number(null) 会塌成 0，必须先判空）
+    const rawCache = valid ? stats.cache_rate : null;
+    const cacheRate = (rawCache === null || rawCache === undefined) ? NaN : Number(rawCache);
+    const pct = Number.isFinite(cacheRate) ? `${Math.round(cacheRate * 100)}%` : "--";
+    statsBar.appendChild(el("span", {
+      class: "sb-item sb-cache",
+      text: t("stats.cache", "缓存 {pct}").replace("{pct}", pct),
+    }));
+    // 上下文用量：有 max_context_tokens 用 {used}/{max}，否则仅 {used}；缺省 "--"
+    const rawUsed = valid ? stats.context_tokens : null;
+    const rawMax = valid ? stats.max_context_tokens : null;
+    const usedTokens = (rawUsed === null || rawUsed === undefined) ? NaN : Number(rawUsed);
+    const maxTokens = (rawMax === null || rawMax === undefined) ? NaN : Number(rawMax);
+    const used = Number.isFinite(usedTokens) ? fmtTokens(usedTokens) : "--";
+    const label = (Number.isFinite(maxTokens) && maxTokens > 0)
+      ? t("stats.context", "上下文 {used}/{max}")
+        .replace("{used}", used)
+        .replace("{max}", fmtTokens(maxTokens))
+      : t("stats.contextNoMax", "上下文 {used}").replace("{used}", used);
+    statsBar.appendChild(el("span", { class: "sb-item sb-ctx", text: label }));
   }
 
   /* ── 装配 ───────────────────────────────────────────── */

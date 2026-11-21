@@ -357,7 +357,8 @@
 
 /* 统计栏（T7f）：composer 输入区上方窄横栏；stats 事件注入 .sb-item。
    置于 .composer-inner 内时经父级 padding 与输入区左右自然对齐；
-   置于外层时按 max-width + auto 外边距自行居中。空态隐藏。 */
+   置于外层时按 max-width + auto 外边距自行居中。常驻栏位：无数据由
+   composer 以 "--" 占位（v0.4.2，原 :empty 隐藏已移除）。 */
 .stats-bar {
   width: 100%;
   max-width: var(--flow-max);
@@ -372,10 +373,6 @@
   color: var(--text-secondary);
   white-space: nowrap;
   overflow: hidden;
-}
-
-.stats-bar:empty {
-  display: none;
 }
 
 .stats-bar .sb-item {

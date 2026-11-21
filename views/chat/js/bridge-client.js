@@ -30,7 +30,7 @@ import { createMockTransport } from "./mock.js";
 
 /** 与 metadata.yaml version 保持一致（加载屏/侧栏脚注显示用）。 */
 export const PLUGIN_NAME = "astrbot_plugin_webui";
-export const PLUGIN_VERSION = "0.4.1";
+export const PLUGIN_VERSION = "0.4.2";
 
 const CHANNEL = "astrbot-plugin-page";
 const READY_TIMEOUT = 4000;

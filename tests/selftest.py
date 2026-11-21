@@ -13,7 +13,7 @@
   - C：umo 构造、cid/conv_id 双主键（new_conversation 的 umo 与注入 umo 逐字符
     一致、get_conversation/update_conversation 经 conv_id）、会话 CRUD 映射宿主、
     历史映射（plain 拼接 / think→reasoning / tool_call parts→tools / agent_stats→
-    usage / 媒体 parts→attachments 索引反查）、分页语义（page 1 最新、页内旧->新、
+    usage+stats / 媒体 parts→attachments 索引反查）、分页语义（page 1 最新、页内旧->新、
     has_more 配 count）、legacy 归档响应附 legacy:true、级联/legacy 删除分支；
   - D：生成内核「注入-排水」——注入三步形状（平台历史剥 path / back_queue /
     会话队列 tuple / flags（enable_streaming 回读宿主配置）/ checkpoint 同源）、
@@ -709,7 +709,7 @@ async def _test_conversation_service() -> None:
     check("C16 列表项契约键", set(shape.keys()) == {"cid", "title", "persona_id", "updated_at"}, str(shape.keys()))
     check("C17 updated_at ISO 带时区", "T" in shape["updated_at"])
 
-    # 历史读取：平台历史映射（user + bot 含 reasoning/tools/usage/attachments）
+    # 历史读取：平台历史映射（user + bot 含 reasoning/tools/usage/stats/attachments）
     cid1 = info["cid"]
     hm = context.message_history_manager
     await hm.insert(
@@ -750,6 +750,7 @@ async def _test_conversation_service() -> None:
     check("C19 历史两条（user+bot）", [m["role"] for m in result["messages"]] == ["user", "assistant"], str(result["messages"]))
     bot_msg = result["messages"][1]
     check("C20 bot 文本/reasoning/usage", bot_msg["text"] == "这是一张图" and bot_msg["reasoning"] == {"content": "想了想"} and bot_msg["usage"] == {"output": 5, "total": 10}, str(bot_msg))
+    check("C20-1 bot stats 映射（常驻统计栏恢复源）", bot_msg.get("stats") == {"cache_rate": 0.4, "context_tokens": 0, "max_context_tokens": None, "input_cached": 2, "input_other": 3, "output": 5}, str(bot_msg.get("stats")))
     check("C21 bot tools 映射", bot_msg["tools"][0]["name"] == "get_weather" and bot_msg["tools"][0]["result"] == "晴", str(bot_msg.get("tools")))
     user_msg = result["messages"][0]
     check("C22 user 附件索引反查", [a["file_id"] for a in user_msg.get("attachments") or []] == ["f_img1"], str(user_msg.get("attachments")))
