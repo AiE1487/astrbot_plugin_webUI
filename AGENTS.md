@@ -1,7 +1,7 @@
 # AGENTS.md — astrbot_plugin_webui
 
 AstrBot 插件「酒馆风对话 WebUI」（类 SillyTavern 网页聊天视图）。基准宿主
-AstrBot 4.29.4，插件 Python ≥3.12，无第三方 pip 依赖。当前版本 **v0.3.1**，
+AstrBot 4.29.4，插件 Python ≥3.12，无第三方 pip 依赖。当前版本 **v0.4.0**，
 origin = `https://github.com/AiE1487/astrbot_plugin_webUI.git`（main）。
 
 ## 目录布局（2026-11-14 起扁平化，先读）
@@ -20,7 +20,7 @@ views/、tests/、metadata.yaml 等全部在仓库根，所有命令一律在仓
   传输层（bridge / postMessage fallback / standalone / mock 四模式自动探测），
   `js/components/`（composer/message/panels/sidebar）、`store.js`/`api.js`/
   `sse.js`/`markdown.js` 按职责分文件。
-- `tests/selftest.py`（stub 宿主自测，314 项断言）+ `tests/stub/astrbot/`
+- `tests/selftest.py`（stub 宿主自测，342 项断言）+ `tests/stub/astrbot/`
   （宿主 API 桩）。
 - `.astrbot-plugin/i18n/` —— zh-CN / en-US 文案字典（与 bridge-client.js 内
   字典双份，键两侧对齐）。
@@ -46,7 +46,7 @@ views/、tests/、metadata.yaml 等全部在仓库根，所有命令一律在仓
 ```bash
 cd F:/work/AICoding/UniversalFolder/astrbot_plugin_webUI
 ./.venv/bin/python.exe -m compileall -q main.py core
-./.venv/bin/python.exe tests/selftest.py        # 314 项断言全过
+./.venv/bin/python.exe tests/selftest.py        # 342 项断言全过
 node --check views/chat/js/<改动的js>           # 逐文件语法
 ./.venv/bin/python.exe "C:/Users/14835/.agents/skills/astrbot-plugin-dev/scripts/package_plugin.py" . --check
 # 打包：同命令去掉 --check（产物 dist/astrbot_plugin_webui-v<版本>.zip）

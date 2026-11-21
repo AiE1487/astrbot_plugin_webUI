@@ -30,7 +30,7 @@ import { createMockTransport } from "./mock.js";
 
 /** 与 metadata.yaml version 保持一致（加载屏/侧栏脚注显示用）。 */
 export const PLUGIN_NAME = "astrbot_plugin_webui";
-export const PLUGIN_VERSION = "0.3.6";
+export const PLUGIN_VERSION = "0.4.0";
 
 const CHANNEL = "astrbot-plugin-page";
 const READY_TIMEOUT = 4000;
@@ -104,6 +104,7 @@ export const safeStorage = {
 const TRANSLATIONS = {
   "zh-CN": {
     "title": "对话",
+    "description": "酒馆风对话界面：选择人格、发送消息、查看流式回复。",
     "loading.initial": "连接宿主中",
     "loading.data": "加载数据中",
     "loading.done": "就绪",
@@ -165,6 +166,13 @@ const TRANSLATIONS = {
     "composer.dropHint": "松开以添加附件",
     "composer.sending": "发送中…",
     "composer.legacyNotice": "旧版会话为只读归档，无法继续对话",
+    "composer.mergeTip": "并入下一条（合并发送）",
+    "composer.queuedBadge": "待合并",
+    "composer.queuedRemove": "移除",
+    "composer.replying": "{persona} 正在回复中",
+    "stats.cache": "缓存 {pct}",
+    "stats.context": "上下文 {used}/{max}",
+    "stats.contextNoMax": "上下文 {used}",
     "error.sessionBusy": "该会话正在生成回复，请等待完成或先停止",
     "error.concurrencyLimit": "全局并发已达上限，请稍后再试",
     "error.payloadTooLarge": "文件超过上传大小上限",
@@ -211,6 +219,7 @@ const TRANSLATIONS = {
   },
   "en-US": {
     "title": "Chat",
+    "description": "Tavern-style chat: pick a persona, send messages, watch streaming replies.",
     "loading.initial": "Connecting host",
     "loading.data": "Loading data",
     "loading.done": "Ready",
@@ -272,6 +281,13 @@ const TRANSLATIONS = {
     "composer.dropHint": "Drop to add attachments",
     "composer.sending": "Sending…",
     "composer.legacyNotice": "Legacy conversations are read-only archives.",
+    "composer.mergeTip": "Queue & merge into next send",
+    "composer.queuedBadge": "QUEUED",
+    "composer.queuedRemove": "Remove queued",
+    "composer.replying": "{persona} is replying…",
+    "stats.cache": "Cache {pct}",
+    "stats.context": "Context {used}/{max}",
+    "stats.contextNoMax": "Context {used}",
     "error.sessionBusy": "This conversation is already generating. Wait for it to finish or stop it first.",
     "error.concurrencyLimit": "Global concurrency limit reached. Try again later.",
     "error.payloadTooLarge": "File exceeds the upload size limit",

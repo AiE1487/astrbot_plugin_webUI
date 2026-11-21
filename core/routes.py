@@ -6,9 +6,9 @@
 （standalone.py）挂同路径的同款 handler）::
 
     GET    health                    连通性探测
-    GET    config                    前端展示配置（user_display_name）
+    GET    config                    前端展示配置（user_display_name、streaming_response）
     GET    personas                  人格列表（id、名称、system_prompt 摘要、工具、默认）
-    GET    conversations             会话列表（cid、title、persona_id、updated_at、busy、legacy?）
+    GET    conversations             会话列表（cid、title、persona_id、updated_at、busy、gen_id、legacy?）
     POST   conversations             新建 {persona_id, title?} -> {cid}
     DELETE conversations/<cid>       删除会话（宿主级联 / legacy 归档分支）
     POST   conversations/<cid>/delete  同上（bridge SDK 无 DELETE 方法的等价别名）
@@ -51,7 +51,7 @@ from astrbot.api.web import (
     stream_response,
 )
 
-from . import attachment_service, chat_service, conversation_service, persona_service, sse, uistore
+from . import attachment_service, chat_service, conversation_service, persona_service, pipeline_bridge, sse, uistore
 
 PLUGIN_NAME = "astrbot_plugin_webui"
 
@@ -217,10 +217,18 @@ async def handle_health(plugin: Star):
 async def handle_get_config(plugin: Star):
     """GET config —— 前端展示配置（非敏感子集，随配置面板实时变化）。
 
-    仅透出展示用字段：``user_display_name``（用户消息显示名，默认 USER）。
-    独立端口与内嵌视图共用；前端启动时装载，改动后刷新页面生效。
+    透出展示用字段：``user_display_name``（用户消息显示名，默认 USER）与
+    ``streaming_response``（宿主 ``provider_settings.streaming_response`` 回显，
+    经 pipeline_bridge.read_streaming_response 同源读取——与注入 flags 的
+    enable_streaming 一致）。独立端口与内嵌视图共用；前端启动时装载，改动后
+    刷新页面生效。
     """
-    return json_response({"user_display_name": str(plugin.config["user_display_name"])})
+    return json_response(
+        {
+            "user_display_name": str(plugin.config["user_display_name"]),
+            "streaming_response": pipeline_bridge.read_streaming_response(plugin.context),
+        }
+    )
 
 
 @_endpoint
@@ -236,12 +244,21 @@ async def handle_personas(plugin: Star):
 
 @_endpoint
 async def handle_list_conversations(plugin: Star):
-    """GET conversations —— 会话列表（updated_at 降序；宿主项并入 busy，legacy 项恒 false）。"""
+    """GET conversations —— 会话列表（updated_at 降序；宿主项并入 busy/gen_id）。
+
+    ``gen_id = chat_service.active_generation_id(cid)``（单次扫描同时产出 busy，
+    避免两次遍历任务表）；后台回复恢复的数据源：前端刷新/重连后按 gen_id 重
+    订阅 SSE。legacy 项恒 ``busy=false`` / ``gen_id=null``。
+    """
     items = await conversation_service.list_conversations(plugin.context, plugin.data_dir())
     for item in items:
         if item.get("legacy"):
-            continue  # legacy 归档只读，不存在进行中生成
-        item["busy"] = chat_service.active_generation_id(item["cid"]) is not None
+            item["busy"] = False  # legacy 归档只读，不存在进行中生成
+            item["gen_id"] = None
+            continue
+        gen_id = chat_service.active_generation_id(item["cid"])
+        item["busy"] = gen_id is not None
+        item["gen_id"] = gen_id
     return json_response({"conversations": items})
 
 

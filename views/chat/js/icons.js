@@ -57,6 +57,8 @@ const ICON_PATHS = {
   send: `<path d="M3 11.5 21 3l-8.5 18-2.3-7.2L3 11.5Z" fill="currentColor" stroke="none"/>`,
   stop: `<rect x="6.5" y="6.5" width="11" height="11" rx="1.5" fill="currentColor" stroke="none"/>`,
   plus: `<path ${STROKE_ATTRS} d="M12 5v14M5 12h14"/>`,
+  // merge（T1 合并按钮）：上下两支箭头向中线聚拢（手写 path，24 viewBox）
+  merge: `<path ${STROKE_ATTRS} d="M12 3.5v5M9.5 6 12 8.5 14.5 6M12 20.5v-5M9.5 18 12 15.5 14.5 18"/>`,
   trash: `<path ${STROKE_ATTRS} d="M4 7h16M10 7V4.5h4V7M6.5 7 7.5 20h9L17.5 7M10 11v5.5M14 11v5.5"/>`,
   image: `<rect ${STROKE_ATTRS} x="3" y="5" width="18" height="14" rx="2"/><circle ${STROKE_ATTRS} cx="8.5" cy="9.5" r="1.6"/><path ${STROKE_ATTRS} d="M3 16.5 8 12l4 3.5 4-4 5 5"/>`,
   fileText: `<path ${STROKE_ATTRS} d="M6 3h8l5 5v13H6V3Z"/><path ${STROKE_ATTRS} d="M14 3v5h5M9 12h6M9 16h6"/>`,

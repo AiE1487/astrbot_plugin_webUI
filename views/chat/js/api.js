@@ -283,9 +283,11 @@ export function createApi(transport) {
   }
 
   /**
-   * GET config → {user_display_name} —— 插件展示配置（用户消息显示名）。
+   * GET config → {user_display_name, streaming_response} —— 插件展示配置
+   * （用户消息显示名 + 非流式开关；streaming_response 为 T3 新增可选字段，
+   * 旧版后端缺省，调用方按 boolean 缺省 true 处理）。
    * mock / 旧版后端无此端点时抛 ApiError(404)，调用方按「沿用默认 USER」降级。
-   * @returns {Promise<{user_display_name: string} | null>}
+   * @returns {Promise<{user_display_name: string, streaming_response?: boolean} | null>}
    */
   async function getConfig() {
     try {

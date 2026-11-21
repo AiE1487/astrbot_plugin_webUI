@@ -70,7 +70,7 @@ export function createMessageFlow({ scrollEl, store, api, transport, t, onPinned
   let pinned = true;
   /** @type {Map<string, boolean>} 用户手动开合的 reasoning（id → open） */
   const reasoningToggled = new Map();
-  /** @type {{genId: string, msgId: string, mdHost: HTMLElement, cursor: HTMLElement, latestText: string, reasoningWrap: HTMLElement, reasoningText: Text, reasoningCursor: HTMLElement, reasoningHeadState: HTMLElement, reasoningBlock: HTMLElement, toolsHolder: HTMLElement, waitRow: HTMLElement, panels: Map<string, {update: Function}>} | null} */
+  /** @type {{genId: string, msgId: string, mdHost: HTMLElement, cursor: HTMLElement, latestText: string, reasoningWrap: HTMLElement, reasoningText: Text, reasoningCursor: HTMLElement, reasoningHeadState: HTMLElement, reasoningBlock: HTMLElement, reasoningBody: HTMLElement | null, attachmentsHolder: HTMLElement, attachmentIds: Set<string>, toolsHolder: HTMLElement, waitRow: HTMLElement, waitLabel: HTMLElement, panels: Map<string, {update: Function}>} | null} */
   let streamingRefs = null;
   let loadMoreBusy = false;
 
@@ -138,6 +138,17 @@ export function createMessageFlow({ scrollEl, store, api, transport, t, onPinned
   /** 用户展示名（meta 行）：插件配置 user_display_name 优先，空回退 i18n 默认 USER。 */
   function userLabel() {
     return String(store.state.userDisplayName ?? "").trim() || t("msg.roleUser", "USER");
+  }
+
+  /**
+   * 等待行文案（T5f）：宿主 provider 关闭流式（streaming_response=false）时
+   * 显示「{persona} 正在回复中」，否则维持「发送中…」。
+   */
+  function waitText() {
+    if (store.state.streamingResponse === false) {
+      return t("composer.replying", "{persona} 正在回复中").replace("{persona}", assistantLabel());
+    }
+    return t("composer.sending", "发送中…");
   }
 
   /**
@@ -243,9 +254,15 @@ export function createMessageFlow({ scrollEl, store, api, transport, t, onPinned
         ? t("msg.thinking", "THINKING · 思考中")
         : t("msg.reasoningDone", "已完成思考");
       block.style.display = content || active ? "" : "none";
+      // T4：流式期间展开（含用户手动点开）跟随最新输出滚到底部；仅距底 <40px
+      // 才滚（仿主滚动 pinned 思路），用户上翻阅读旧思考不被强制回弹
+      if (msg.streaming && open && Boolean(content)
+        && body.scrollHeight - body.scrollTop - body.clientHeight < 40) {
+        body.scrollTop = body.scrollHeight;
+      }
     }
     syncReasoning();
-    return { block, syncReasoning };
+    return { block, body, syncReasoning };
   }
 
   /**
@@ -261,12 +278,15 @@ export function createMessageFlow({ scrollEl, store, api, transport, t, onPinned
     const main = el("div", { class: "msg-main" });
     wrap.appendChild(main);
 
-    // meta 行：角色标签（AI → 人格名）+ 可开关的时间戳
+    // meta 行：角色标签（AI → 人格名）+ 可开关的时间戳 + 队列徽标（T1f）
     const metaChildren = [
       el("span", { text: isUser ? userLabel() : assistantLabel() }),
     ];
     if (settings.showTimestamps !== false && hhmm(msg.ts)) {
       metaChildren.push(el("span", { text: hhmm(msg.ts) }));
+    }
+    if (msg.queued) {
+      metaChildren.push(el("span", { class: "msg-queued-badge", text: t("composer.queuedBadge", "待合并") }));
     }
     main.appendChild(el("div", { class: "msg-meta" }, metaChildren));
 
@@ -279,6 +299,18 @@ export function createMessageFlow({ scrollEl, store, api, transport, t, onPinned
       if (Array.isArray(msg.attachments) && msg.attachments.length > 0) {
         main.appendChild(el("div", { class: "msg-attachments" }, ...msg.attachments.map(buildAttachment)));
       }
+      // 队列消息（T1f）：气泡后挂移除按钮；removeQueued 后 store emit("messages")
+      // 触发整体重渲染，队列索引无需本地修正（索引非法时不渲染按钮，防误删）
+      const queuedIndex = Number(msg.queuedIndex);
+      if (msg.queued && Number.isInteger(queuedIndex)) {
+        main.appendChild(el("button", {
+          class: "queued-remove",
+          type: "button",
+          title: t("composer.queuedRemove", "移除"),
+          "aria-label": t("composer.queuedRemove", "移除"),
+          onclick: () => store.removeQueued?.(currentCid, queuedIndex),
+        }, icon("close", { size: 10 })));
+      }
       return wrap;
     }
 
@@ -288,8 +320,11 @@ export function createMessageFlow({ scrollEl, store, api, transport, t, onPinned
     const streaming = Boolean(msg.streaming) || Boolean(msg.pendingPoll);
 
     // 思考区（流式占位始终渲染：空内容时隐藏，便于增量 patch）
+    let reasoningBody = /** @type {HTMLElement | null} */ (null);
     if (msg.reasoning || msg.reasoningActive || msg.streaming) {
-      card.appendChild(buildReasoning(msg).block);
+      const reasoningParts = buildReasoning(msg);
+      card.appendChild(reasoningParts.block);
+      reasoningBody = reasoningParts.body;
     }
 
     // 正文（markdown 渲染；流式增量只改这个容器）
@@ -304,9 +339,24 @@ export function createMessageFlow({ scrollEl, store, api, transport, t, onPinned
     }
 
     // 附件（v1.1：助手消息 attachments[] 与用户消息同构，渲染路径角色无关，
-    // 复用同一 buildAttachment / .msg-attachments 样式，容器内左对齐见 CSS）
-    if (Array.isArray(msg.attachments) && msg.attachments.length > 0) {
-      card.appendChild(el("div", { class: "msg-attachments" }, ...msg.attachments.map(buildAttachment)));
+    // 复用同一 buildAttachment / .msg-attachments 样式，容器内左对齐见 CSS；
+    // T2f：流式占位容器常驻，media 事件经 patchStreaming 按 file_id 增量 append）
+    const attachmentsHolder = el("div", { class: "msg-attachments" });
+    const attachmentIds = new Set();
+    const initialAttachments = Array.isArray(msg.attachments) ? msg.attachments : [];
+    for (const meta of initialAttachments) {
+      // 初始渲染同样按 file_id 去重（首个出现者渲染），与 patchStreaming 的
+      // attachmentIds 增量去重同层一致：renderAll 重建/终态消息含重复时不显示重复卡
+      const key = String(meta?.file_id ?? "");
+      if (key && attachmentIds.has(key)) continue;
+      if (key) attachmentIds.add(key);
+      attachmentsHolder.appendChild(buildAttachment(meta));
+    }
+    if (initialAttachments.length > 0) {
+      card.appendChild(attachmentsHolder);
+    } else if (msg.streaming) {
+      attachmentsHolder.style.display = "none"; // 无附件隐藏，media 增量到达时切回
+      card.appendChild(attachmentsHolder);
     }
 
     // 工具面板（历史与流式共用；M3 ⑤ 分页 prepend 同样渲染 tools）
@@ -323,8 +373,9 @@ export function createMessageFlow({ scrollEl, store, api, transport, t, onPinned
       card.appendChild(toolsHolder);
     }
 
-    // 等待首增量
-    const waitRow = el("div", { class: "stream-wait" }, el("span", { class: "spinner" }), t("composer.sending", "发送中…"));
+    // 等待首增量（T5f：非流式模式显示「{persona} 正在回复中」，文案随 patch 刷新）
+    const waitLabel = el("span", { text: waitText() });
+    const waitRow = el("div", { class: "stream-wait" }, el("span", { class: "spinner" }), waitLabel);
     const showWait = Boolean(msg.pendingPoll)
       || (Boolean(msg.streaming) && !msg.text && !msg.reasoningActive && !(msg.tools?.length));
     waitRow.style.display = showWait ? "" : "none";
@@ -372,8 +423,12 @@ export function createMessageFlow({ scrollEl, store, api, transport, t, onPinned
           reasoningCursor: /** @type {HTMLElement} */ (reasoningBlock?.querySelector(".breathe-cursor")),
           reasoningHeadState: /** @type {HTMLElement} */ (reasoningBlock?.querySelector(".reasoning-state")),
           reasoningBlock: /** @type {HTMLElement} */ (reasoningBlock),
+          reasoningBody,
+          attachmentsHolder,
+          attachmentIds,
           toolsHolder,
           waitRow,
+          waitLabel,
           panels,
         };
       }
@@ -508,6 +563,24 @@ export function createMessageFlow({ scrollEl, store, api, transport, t, onPinned
           ? t("msg.thinking", "THINKING · 思考中")
           : t("msg.reasoningDone", "已完成思考");
       }
+      // T4：展开状态下每次增量跟随最新思考输出滚到底部；仅距底 <40px 才滚
+      //（仿主滚动 pinned 思路），用户上翻阅读旧思考不被强制回弹
+      if (open && refs.reasoningBody) {
+        const reasoningBodyEl = refs.reasoningBody;
+        if (reasoningBodyEl.scrollHeight - reasoningBodyEl.scrollTop - reasoningBodyEl.clientHeight < 40) {
+          reasoningBodyEl.scrollTop = reasoningBodyEl.scrollHeight;
+        }
+      }
+    }
+    // 附件（T2f：media 事件 → stream.attachments，按 file_id 去重增量 append）
+    if (Array.isArray(stream.attachments) && refs.attachmentsHolder) {
+      for (const meta of stream.attachments) {
+        const key = String(meta?.file_id ?? "");
+        if (!key || refs.attachmentIds.has(key)) continue;
+        refs.attachmentIds.add(key);
+        refs.attachmentsHolder.appendChild(buildAttachment(meta));
+      }
+      refs.attachmentsHolder.style.display = refs.attachmentsHolder.childElementCount > 0 ? "" : "none";
     }
     // 工具面板
     for (const tool of stream.tools) {
@@ -524,8 +597,9 @@ export function createMessageFlow({ scrollEl, store, api, transport, t, onPinned
         panel.update(tool);
       }
     }
-    // 等待行
+    // 等待行（T5f：文案随 streamingResponse 设置切换）
     const showWait = !stream.text && !stream.reasoningActive && stream.tools.length === 0;
+    refs.waitLabel.textContent = waitText();
     refs.waitRow.style.display = showWait ? "" : "none";
     if (pinned) scrollToBottom();
   }

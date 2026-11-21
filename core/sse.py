@@ -1,8 +1,8 @@
 """SSE 事件封装与缓冲（纯逻辑，无宿主依赖，桩测友好）。
 
 契约（对接契约 v2 §SSE / UserPlan §3.2）：
-- 事件类型：reasoning_delta / text_delta / tool_call / tool_result / done /
-  stopped / error；终态三类 = done / stopped / error(fatal=True)；
+- 事件类型：reasoning_delta / text_delta / tool_call / tool_result / media /
+  stats / done / stopped / error；终态三类 = done / stopped / error(fatal=True)；
 - 每个事件的 data 首字段 ``seq`` 从 0 递增；订阅时从 seq=0 全量重放缓冲，
   再接实时；缓冲保留 >=5 分钟（由 chat_service 的 TTL 控制，本模块不感知时间）；
 - 帧格式（``stream_response`` + ``text/event-stream``）::
@@ -23,6 +23,8 @@ EVENT_TYPES = (
     "text_delta",
     "tool_call",
     "tool_result",
+    "media",
+    "stats",
     "done",
     "stopped",
     "error",

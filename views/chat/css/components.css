@@ -355,6 +355,34 @@
   gap: 8px;
 }
 
+/* 统计栏（T7f）：composer 输入区上方窄横栏；stats 事件注入 .sb-item。
+   置于 .composer-inner 内时经父级 padding 与输入区左右自然对齐；
+   置于外层时按 max-width + auto 外边距自行居中。空态隐藏。 */
+.stats-bar {
+  width: 100%;
+  max-width: var(--flow-max);
+  margin: 0 auto;
+  height: 20px;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 0 4px;
+  font-size: 11px;
+  letter-spacing: 0.02em;
+  color: var(--text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.stats-bar:empty {
+  display: none;
+}
+
+.stats-bar .sb-item {
+  flex: none;
+  font-variant-numeric: tabular-nums;
+}
+
 /* 附件预览条：缩略图/文件卡 + 可移除（M3 ①） */
 .attach-preview {
   display: none;
@@ -587,6 +615,30 @@
 }
 
 .attach-btn:disabled {
+  color: var(--text-disabled);
+  background: rgba(255, 255, 255, 0.03);
+}
+
+/* 合并按钮（T1）：与附件按钮同构（42×42 描边方形；图标色随 currentColor） */
+.merge-btn {
+  width: 42px;
+  height: 42px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius);
+  border: 1px solid var(--line-border);
+  background: var(--bg-item);
+  color: var(--text-caption);
+  transition: background-color var(--t-fast) var(--ease-out), color var(--t-fast) var(--ease-out);
+}
+
+.merge-btn:hover {
+  background: var(--accent-10);
+  color: var(--accent-strong);
+}
+
+.merge-btn:disabled {
   color: var(--text-disabled);
   background: rgba(255, 255, 255, 0.03);
 }

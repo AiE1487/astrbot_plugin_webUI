@@ -5,7 +5,12 @@
  * - 会话列表 / 当前会话 / 人格 / 富历史（分页）/ 流式缓冲状态机 / 连接与 UI 状态。
  * - 活跃 gen_id 存 sessionStorage（沙箱下经 safeStorage 退化为内存），刷新后由
  *   服务端全量重放续流（计划 F3）；收到 404 或任一终态后清理该 gen_id。
+ *   兜底：GET conversations 对 busy 项下发 gen_id（跨浏览器/关标签页后
+ *   sessionStorage 已丢），装载会话列表时据此恢复活跃 gen 订阅。
  * - busy 会话禁发（M2 ②）；流式中收到 error.code=model_not_multimodal 标记消息失败。
+ * - 合并队列（按 cid）：busy 期间经 composer 并入的待合并消息，
+ *   viewMessages 合成为 queued:true 的用户消息上屏，下一轮发送时合并发出。
+ * - 上下文统计（stats 事件）按 cid 保留至该会话下次生成（终态不清理）。
  * - 通知采用 topic 批处理（微任务合并），组件按 topic 粒度重渲染；
  *   增量渲染合并 DOM 写入（text_delta 只增改流式消息的文本节点）。
  *
@@ -97,6 +102,7 @@ function normalizeMessage(raw) {
  * @property {boolean} reasoningActive 思考流式进行中（自动展开 + 呼吸光标依据）
  * @property {boolean} textActive 正文流式进行中（打字光标依据）
  * @property {any[]} tools
+ * @property {any[]} attachments 流中收到的附件元数据（media 事件；渲染代理消费 streamView.attachments）
  * @property {{message: string, fatal: boolean, code?: string}|null} lastNonFatalError
  * @property {boolean} failed 生成失败标记（model_not_multimodal 等）
  */
@@ -138,6 +144,12 @@ export function createStore({ api, transport, t }) {
   const streamsByGen = new Map();
   /** @type {Map<string, string>} cid → genId */
   const activeGenByCid = new Map();
+  /** 合并队列（T1）：cid → [{text, attachments}]，busy 排队场景，下一轮发送时合并发出。 */
+  /** @type {Map<string, Array<{text: string, attachments: any[]}>>} */
+  const queuedByCid = new Map();
+  /** 上下文统计（T4）：cid → 最近一次 stats 事件负载；终态不清理，保留到下次生成。 */
+  /** @type {Map<string, Record<string, any>>} */
+  const statsByCid = new Map();
 
   const state = {
     mode: /** @type {string} */ (transport.mode),
@@ -154,6 +166,7 @@ export function createStore({ api, transport, t }) {
     bannerGone: false, // 流 404/过期横幅
     showReasoningDefault: false,
     userDisplayName: /** @type {string} */ (""), // 用户消息显示名（GET config；空回退 i18n USER）
+    streamingResponse: /** @type {boolean} */ (true), // GET config streaming_response（缺省/旧后端/mock → true）
     uiSettings: { ...UI_SETTINGS_DEFAULTS },
     lastError: /** @type {{kind: string, message: string}|null} */ (null),
   };
@@ -201,15 +214,21 @@ export function createStore({ api, transport, t }) {
     }
   }
 
-  /** @returns {Promise<void>} 拉取插件展示配置（用户显示名；失败静默回退 i18n）。 */
+  /** @returns {Promise<void>} 拉取插件展示配置（用户显示名 + 流式开关；失败静默回退默认）。 */
   async function pullRemoteConfig() {
     try {
       const config = await api.getConfig();
       if (config && typeof config.user_display_name === "string") {
         state.userDisplayName = config.user_display_name;
       }
+      // T3 非流式配置装载：streaming_response 缺省（旧后端/mock）或拉取异常 → 保持 true
+      const streaming = typeof config?.streaming_response === "boolean" ? config.streaming_response : true;
+      if (streaming !== state.streamingResponse) {
+        state.streamingResponse = streaming;
+        emit("ui");
+      }
     } catch {
-      /* mock / 旧版后端无此端点 → 沿用 i18n 默认 USER */
+      /* mock / 旧版后端无此端点 → 沿用 i18n 默认 USER，streamingResponse 保持 true */
     }
   }
 
@@ -271,6 +290,23 @@ export function createStore({ api, transport, t }) {
     });
     if (stream.reasoning) message.reasoning = { content: stream.reasoning };
     if (stream.tools.length > 0) message.tools = stream.tools;
+    if (Array.isArray(stream.attachments) && stream.attachments.length > 0) {
+      // media 事件附件随终态消息落本地历史（与真后端富历史一致，刷新前仍可见）；
+      // 防御性按 file_id 去重（与 media 事件入流查重同一规则，缺失 file_id 直通）
+      const deduped = [];
+      const seenFileIds = new Set();
+      for (const item of stream.attachments) {
+        const fileId = item?.file_id === undefined || item?.file_id === null
+          ? ""
+          : String(item.file_id);
+        if (fileId) {
+          if (seenFileIds.has(fileId)) continue;
+          seenFileIds.add(fileId);
+        }
+        deduped.push({ ...item });
+      }
+      if (deduped.length > 0) message.attachments = deduped;
+    }
     if (terminalType === "done" && terminalData?.usage) {
       message.usage = {
         output: Number(terminalData.usage.output ?? 0),
@@ -338,6 +374,34 @@ export function createStore({ api, transport, t }) {
         }
         break;
       }
+      case "media": {
+        // 流中附件（契约 SSE media 事件）：累入 stream.attachments，渲染层经
+        // viewMessages 的 streamView.attachments 消费；按 file_id 查重后 push
+        //（sse 层重订阅会从 seq=0 全量重放 media 事件，不去重会重复累积；
+        // 缺失 file_id 的载荷无法比对，直接 push）
+        const attachment = data?.attachment;
+        if (attachment && typeof attachment === "object") {
+          if (!Array.isArray(stream.attachments)) stream.attachments = [];
+          const fileId = attachment.file_id === undefined || attachment.file_id === null
+            ? ""
+            : String(attachment.file_id);
+          const duplicated = fileId
+            ? stream.attachments.some((item) => item && String(item.file_id) === fileId)
+            : false;
+          if (!duplicated) {
+            stream.attachments.push(attachment);
+            emit("stream");
+          }
+        }
+        break;
+      }
+      case "stats": {
+        // 上下文统计（契约 SSE stats 事件）：按 cid 写入并保留到下次生成（终态不清理）
+        const payload = data && typeof data === "object" ? data : {};
+        statsByCid.set(stream.cid, { ...(statsByCid.get(stream.cid) ?? {}), ...payload });
+        emit("stream");
+        break;
+      }
       case "error": {
         // fatal 已由 sse 层转终态；这里只接流内非 fatal 错误（流继续）
         stream.lastNonFatalError = {
@@ -374,16 +438,20 @@ export function createStore({ api, transport, t }) {
     refreshConversationsSoon();
   }
 
-  /** 清理未落定的流式占位（评审发现 3：exhausted/gone 路径与终态同样清理）。 */
+  /**
+   * 清理未落定的流式占位（评审发现 3：exhausted/gone 路径与终态同样清理）。
+   * @returns {string|null} 被清理的流所属 cid（流已不存在时 null）
+   */
   function discardStreamPlaceholder(genId) {
     const stream = streamsByGen.get(genId);
-    if (!stream) return;
+    if (!stream) return null;
     const { cid } = stream;
     clearActiveGen(cid);
     streamsByGen.delete(genId);
     const history = ensureHistory(cid);
     history.messages = history.messages.filter((item) => item.id !== `stream:${genId}`);
     emit("messages");
+    return cid;
   }
 
   /**
@@ -413,10 +481,50 @@ export function createStore({ api, transport, t }) {
    * @param {string} genId
    */
   function onStreamGone(genId) {
-    discardStreamPlaceholder(genId);
+    const cid = discardStreamPlaceholder(genId);
     state.bannerGone = true;
     emit("stream");
     refreshConversationsSoon();
+    // T2 兜底：流缓冲过期（终局）时「离开期间已完成」的回复不在流里——
+    // 若为当前会话补拉最新历史让回复直接出现（失败静默，横幅已提示）。
+    // 按已加载页数依序补拉：page1 整页替换、后续页 prepend，最终顺序正确，
+    // 保留用户此前向上加载的分页（单次整页替换会把它们清掉）。
+    if (cid && cid === state.currentCid) {
+      const entry = histories.get(cid);
+      if (entry) {
+        const pages = Math.max(1, entry.page || 1);
+        (async () => {
+          for (let page = 1; page <= pages; page += 1) {
+            try {
+              await fetchHistoryPage(cid, page);
+            } catch {
+              return; // 补拉失败静默（横幅已提示）
+            }
+          }
+        })();
+      }
+    }
+  }
+
+  /**
+   * sse 层每次订阅开始时通知（onReset）：服务端从 seq=0 全量重放，重放即重建。
+   * 重置该 genId 流的积累态，防止断线重连/切回会话时重放事件把 text/tools/
+   * attachments 重复累加；restoreStream 刚建的空流经此重置为无操作，安全。
+   * 只动积累字段，不动 phase/genId/cid（订阅身份与占位位置保持不变）。
+   * @param {string} genId
+   */
+  function onStreamReset(genId) {
+    const stream = streamsByGen.get(genId);
+    if (!stream) return;
+    stream.text = "";
+    stream.reasoning = "";
+    stream.tools = [];
+    stream.attachments = [];
+    stream.lastNonFatalError = null;
+    stream.reasoningActive = false;
+    stream.textActive = false;
+    stream.failed = false;
+    emit("stream");
   }
 
   loadActiveGens();
@@ -427,6 +535,7 @@ export function createStore({ api, transport, t }) {
     onTerminal: onStreamTerminal,
     onState: onStreamState,
     onGone: onStreamGone,
+    onReset: onStreamReset,
   });
 
   /* ── 历史与数据装载 ─────────────────────────────────── */
@@ -492,9 +601,12 @@ export function createStore({ api, transport, t }) {
 
   /**
    * 刷新/重进会话时的流恢复：重订阅靠服务端全量重放重建文本。
+   * loadConversations 兜底恢复与 loadHistory 恢复可能竞态双执行：已有同名流时
+   * 直接跳过，避免覆盖正在积累的流式状态（重放重建由 sse onReset 通道负责）。
    * @param {string} cid @param {string} genId
    */
   function restoreStream(cid, genId) {
+    if (streamsByGen.has(genId)) return;
     const stream = /** @type {StreamState} */ ({
       genId,
       cid,
@@ -504,6 +616,7 @@ export function createStore({ api, transport, t }) {
       reasoningActive: false,
       textActive: false,
       tools: [],
+      attachments: [],
       lastNonFatalError: null,
       failed: false,
     });
@@ -533,6 +646,19 @@ export function createStore({ api, transport, t }) {
 
   async function loadConversations() {
     state.conversations = await api.listConversations();
+    // T2 后台回复兜底恢复：busy 项携带 gen_id（REST 契约）。本地无该 cid 的
+    // 活跃 gen 且未订阅该 genId 时（关标签页/换浏览器后 sessionStorage 已丢），
+    // 从列表 gen_id 重建活跃 gen；当前会话再重建流式占位与订阅（服务端全量重放）。
+    for (const convo of state.conversations) {
+      const genId = convo?.gen_id ? String(convo.gen_id) : "";
+      if (!convo?.cid || !convo.busy || !genId) continue;
+      if (activeGenByCid.has(convo.cid)) continue; // 本地已有记录（异常态保守跳过，不覆盖）
+      if (streamsByGen.has(genId)) continue; // 已在订阅中
+      setActiveGen(convo.cid, genId);
+      if (convo.cid === state.currentCid && state.streamAvailable) {
+        restoreStream(convo.cid, genId);
+      }
+    }
     emit("conversations");
   }
 
@@ -601,6 +727,8 @@ export function createStore({ api, transport, t }) {
         clearActiveGen(cid);
       }
     }
+    queuedByCid.delete(cid); // 合并队列随会话一并清空（T1）
+    statsByCid.delete(cid); // 统计栏随会话一并清空（T4）
     await api.deleteConversation(cid);
     histories.delete(cid);
     await loadConversations();
@@ -698,52 +826,63 @@ export function createStore({ api, transport, t }) {
     entry.messages.push(userMessage);
     emit("messages");
 
-    // 降级分支：流式不可用 → 不建流式占位，发送后轮询历史（total 增量判定，
-    // 评审发现 4）；登记活跃 gen_id 使 stop/<gen_id> 在降级模式同样可用（发现 9）
-    if (!state.streamAvailable) {
-      const baselineTotal = Number(entry.total ?? 0);
+    // 乐观气泡回滚：api.send 抛错时把刚 push 的用户气泡从历史移除再上抛——
+    // composer 失败分支保留合并队列供重试，不回滚会在重试成功后出现重复气泡。
+    // 降级分支的 pendingPoll 占位在 api.send 成功后才 push，无需回滚。
+    try {
+      // 降级分支：流式不可用 → 不建流式占位，发送后轮询历史（total 增量判定，
+      // 评审发现 4）；登记活跃 gen_id 使 stop/<gen_id> 在降级模式同样可用（发现 9）
+      if (!state.streamAvailable) {
+        const baselineTotal = Number(entry.total ?? 0);
+        const genId = await api.send(cid, text, fileIds);
+        entry.messages.push(normalizeMessage({
+          id: localId(),
+          role: "assistant",
+          ts: new Date().toISOString(),
+          text: "",
+          pendingPoll: true,
+        }));
+        emit("messages");
+        setActiveGen(cid, genId);
+        pollHistoryUntilReply(cid, baselineTotal);
+        refreshConversationsSoon();
+        return { cid, genId };
+      }
+
       const genId = await api.send(cid, text, fileIds);
+      const stream = /** @type {StreamState} */ ({
+        genId,
+        cid,
+        phase: "streaming",
+        text: "",
+        reasoning: "",
+        reasoningActive: false,
+        textActive: false,
+        tools: [],
+        attachments: [],
+        lastNonFatalError: null,
+        failed: false,
+      });
+      streamsByGen.set(genId, stream);
+      setActiveGen(cid, genId);
+      // 流式占位消息（done 时替换为正式消息）
       entry.messages.push(normalizeMessage({
-        id: localId(),
+        id: `stream:${genId}`,
         role: "assistant",
         ts: new Date().toISOString(),
         text: "",
-        pendingPoll: true,
+        streamingGenId: genId,
       }));
-      emit("messages");
-      setActiveGen(cid, genId);
-      pollHistoryUntilReply(cid, baselineTotal);
+      emit("stream");
+      streams.ensure(genId);
       refreshConversationsSoon();
       return { cid, genId };
+    } catch (error) {
+      const bubbleIndex = entry.messages.indexOf(userMessage);
+      if (bubbleIndex >= 0) entry.messages.splice(bubbleIndex, 1);
+      emit("messages");
+      throw error;
     }
-
-    const genId = await api.send(cid, text, fileIds);
-    const stream = /** @type {StreamState} */ ({
-      genId,
-      cid,
-      phase: "streaming",
-      text: "",
-      reasoning: "",
-      reasoningActive: false,
-      textActive: false,
-      tools: [],
-      lastNonFatalError: null,
-      failed: false,
-    });
-    streamsByGen.set(genId, stream);
-    setActiveGen(cid, genId);
-    // 流式占位消息（done 时替换为正式消息）
-    entry.messages.push(normalizeMessage({
-      id: `stream:${genId}`,
-      role: "assistant",
-      ts: new Date().toISOString(),
-      text: "",
-      streamingGenId: genId,
-    }));
-    emit("stream");
-    streams.ensure(genId);
-    refreshConversationsSoon();
-    return { cid, genId };
   }
 
   /** @param {string} cid */
@@ -786,6 +925,45 @@ export function createStore({ api, transport, t }) {
     }
   }
 
+  /* ── 合并队列（T1 多轮防抖合并发送） ─────────────────── */
+
+  /**
+   * 把一条待发送消息并入该会话的合并队列（busy 排队场景：composer 在 busy 时
+   * 经此入队；下一轮发送时与输入合并成一条消息一次发出）。仅入队不发送。
+   * @param {string} cid
+   * @param {{text?: string, attachments?: any[]}} params attachments 为上传完成的元数据（契约同构）
+   */
+  function queueMessage(cid, { text = "", attachments = [] } = {}) {
+    if (!cid) return;
+    const list = queuedByCid.get(cid) ?? [];
+    list.push({
+      text: String(text ?? ""),
+      attachments: Array.isArray(attachments) ? attachments : [],
+    });
+    queuedByCid.set(cid, list);
+    emit("messages");
+  }
+
+  /**
+   * 从合并队列移除一条待合并消息（队列消息卡上的移除按钮）。
+   * @param {string} cid @param {number} index viewMessages 合成时的 queuedIndex
+   */
+  function removeQueued(cid, index) {
+    const list = queuedByCid.get(cid);
+    if (!list || !Number.isInteger(index) || index < 0 || index >= list.length) return;
+    list.splice(index, 1);
+    if (list.length === 0) queuedByCid.delete(cid);
+    emit("messages");
+  }
+
+  /**
+   * @param {string} cid
+   * @returns {Array<{text: string, attachments: any[]}>} 该会话的合并队列（无队列返回 []）
+   */
+  function queuedOf(cid) {
+    return cid ? queuedByCid.get(cid) ?? [] : [];
+  }
+
   /* ── 连接心跳 ───────────────────────────────────────── */
 
   async function ping() {
@@ -820,15 +998,36 @@ export function createStore({ api, transport, t }) {
   }
 
   /**
-   * 渲染用消息列表：历史消息 + 当前会话的流式占位合成。
+   * 渲染用消息列表：历史消息 + 合并队列合成消息 + 当前会话的流式占位合成。
+   * 队列合成消息插在历史之后、流式占位之前（T1）。
    * @param {string} cid
    */
   function viewMessages(cid) {
     const entry = histories.get(cid);
     const base = entry ? entry.messages : [];
+    // 合并队列合成消息（queued:true 供渲染层加「待合并」徽标与移除按钮）
+    const queued = queuedOf(cid).map((item, idx) => ({
+      id: `queued:${cid}:${idx}`,
+      role: "user",
+      ts: "",
+      text: String(item?.text ?? ""),
+      attachments: Array.isArray(item?.attachments) ? item.attachments.map((a) => ({ ...a })) : [],
+      queued: true,
+      queuedIndex: idx,
+      local: true,
+    }));
     const genId = activeGenByCid.get(cid);
     const stream = genId ? streamsByGen.get(genId) : null;
-    if (!stream) return base.map((item) => ({ ...item }));
+    if (!stream) {
+      // 降级模式（无流式状态）：队列消息同样插到 pendingPoll 占位之前，
+      // 与流式分支时序一致（等待占位恒在列表最末）
+      const copy = base.map((item) => ({ ...item }));
+      const pendingIndex = copy.findIndex((item) => item.pendingPoll);
+      if (pendingIndex >= 0) {
+        return [...copy.slice(0, pendingIndex), ...queued, ...copy.slice(pendingIndex)];
+      }
+      return [...copy, ...queued];
+    }
     // 流式占位：动态合成（消息列表里的占位仅保证顺序位置）
     const placeholderIndex = base.findIndex((item) => item.id === `stream:${genId}`);
     const streamView = {
@@ -840,6 +1039,7 @@ export function createStore({ api, transport, t }) {
       reasoningActive: stream.reasoningActive,
       textActive: stream.textActive,
       tools: stream.tools.map((tool) => ({ ...tool })),
+      attachments: Array.isArray(stream.attachments) ? stream.attachments.map((a) => ({ ...a })) : [],
       usage: null,
       error: stream.lastNonFatalError?.message ?? null,
       streaming: true,
@@ -848,9 +1048,9 @@ export function createStore({ api, transport, t }) {
     if (placeholderIndex >= 0) {
       const copy = base.map((item) => ({ ...item }));
       copy[placeholderIndex] = streamView;
-      return copy;
+      return [...copy.slice(0, placeholderIndex), ...queued, ...copy.slice(placeholderIndex)];
     }
-    return [...base.map((item) => ({ ...item })), streamView];
+    return [...base.map((item) => ({ ...item })), ...queued, streamView];
   }
 
   /* ── i18n 便捷（带 {var} 格式化） ───────────────────── */
@@ -896,6 +1096,10 @@ export function createStore({ api, transport, t }) {
     personaOf,
     sendMessage,
     stopGeneration,
+    queueMessage,
+    removeQueued,
+    queuedOf,
+    statsOf: (cid) => (cid ? statsByCid.get(cid) ?? null : null),
     ping,
     setConn,
     currentHistory,

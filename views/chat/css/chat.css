@@ -438,6 +438,40 @@
   color: var(--text-secondary);
 }
 
+/* ── 队列消息（T1f：待合并徽标 + 移除按钮） ────────────── */
+.msg .msg-queued-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 8px;
+  border: 1px solid rgba(203, 255, 64, 0.45);
+  border-radius: 999px;
+  background: rgba(203, 255, 64, 0.08);
+  color: var(--brand-lime);
+  letter-spacing: 0.14em;
+}
+
+.msg .queued-remove {
+  display: flex;
+  width: 22px;
+  height: 22px;
+  margin-top: 2px;
+  margin-left: auto; /* 用户消息右对齐：块布局下 auto 外边距推至右缘 */
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--line-border);
+  border-radius: var(--radius);
+  background: var(--bg-item);
+  color: var(--text-secondary);
+  transition: background-color var(--t-fast) var(--ease-out), color var(--t-fast) var(--ease-out),
+    border-color var(--t-fast) var(--ease-out);
+}
+
+.msg .queued-remove:hover {
+  color: var(--error);
+  border-color: rgba(249, 111, 104, 0.45);
+  background: rgba(249, 111, 104, 0.08);
+}
+
 /* ── 附件（用户消息内；缩略图/文件卡） ────────────────── */
 .msg .msg-attachments {
   display: flex;

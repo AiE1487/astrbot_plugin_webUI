@@ -9,7 +9,8 @@ import { el, icon } from "../icons.js";
 
 /**
  * 创建一个工具面板实例；调用 update(tool) 原位刷新（增量渲染，避免整列表重建）。
- * 自动展开规则：执行中展开（实时看参数），落定后收起（用户手动展开过则尊重手动）。
+ * 默认折叠（T8）：RUNNING/DONE 状态在头部已可见，参数/结果由用户手动展开查看；
+ * 手动开合状态全程保留，update() 不再改写开合。
  * @param {(key: string, fallback?: string) => string} t
  */
 export function createToolPanel(t) {
@@ -18,16 +19,13 @@ export function createToolPanel(t) {
   const body = el("div", { class: "tp-body" });
   root.append(head, body);
 
-  let phase = "running";
-  let manualToggled = false;
-  let isOpen = true;
+  let isOpen = false;
 
   function applyOpen() {
     root.classList.toggle("is-open", isOpen);
   }
 
   head.addEventListener("click", () => {
-    manualToggled = true;
     isOpen = !isOpen;
     applyOpen();
   });
@@ -74,11 +72,6 @@ export function createToolPanel(t) {
       );
     }
     body.replaceChildren(...children);
-
-    if (!manualToggled) {
-      isOpen = running; // 执行中自动展开、落定自动收起
-    }
-    phase = running ? "running" : "done";
     applyOpen();
   }
 

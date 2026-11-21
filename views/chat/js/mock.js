@@ -14,6 +14,12 @@
  *   >200KB 截断 truncated=true、图片 >20MB 413、类型不在白名单 415
  * - 富历史：attachments/reasoning/tools/usage/error 字段齐全；page=1 最新一页、
  *   页内旧→新、has_more；首条用户消息后标题改为其前 20 字
+ * - media/stats 事件（T4）：正常流各发一次——media（流中附件 meta，f_mock1，
+ *   preview 直出 data URL，置于正文流式前便于观察）在正文前、stats（上下文
+ *   统计 cache_rate/context_tokens/max=null）在终态前；终态消息 attachments
+ *   落历史，done 重建后附件仍可见
+ * - GET conversations 项带 gen_id（REST 契约：busy 时为进行中 gen_id，否则 null），
+ *   供前端 T2 会话列表兜底恢复订阅演示
  *
  * 数据形状与 .astrbot-plugin/i18n、UserPlan 契约逐字段一致。
  */
@@ -349,6 +355,31 @@ export function createMockTransport() {
     return count;
   }
 
+  /** 该会话当前进行中的 gen（GET conversations 下发 gen_id 用；无则 null）。 */
+  function runningGenForCid(cid) {
+    for (const gen of gens.values()) {
+      if (gen.cid === cid && !gen.closed) return gen;
+    }
+    return null;
+  }
+
+  /** T4 media 事件附件 meta（惰性生成一次占位图 data URL；f_mock1 不入 files 层，preview 直出）。 */
+  let mockMediaMeta = null;
+  function mediaEventAttachment() {
+    if (!mockMediaMeta) {
+      mockMediaMeta = attachmentMeta(
+        "f_mock1",
+        "image",
+        "mock-inline-media.png",
+        24_576,
+        "image/png",
+        makePlaceholderImage("MEDIA", 190),
+        false,
+      );
+    }
+    return { ...mockMediaMeta };
+  }
+
   /** 向缓冲写入事件并实时派发给订阅者（每事件首字段 seq，契约 SSE 节）。 */
   function pushEvent(gen, type, data) {
     const seq = gen.events.length;
@@ -453,6 +484,9 @@ export function createMockTransport() {
       step(() => pushEvent(gen, "tool_result", { id: callId, result: "晴 26℃（mock）", elapsed_ms: 812 }));
     }
 
+    // T4：media 事件（流中附件 meta）——置于正文流式之前，整段生成期间均可观察
+    step(() => pushEvent(gen, "media", { attachment: mediaEventAttachment() }));
+
     // 正文流式：2~6 字一块（步长与切片一致，避免重叠/丢字）
     const reply = cannedReplyFor(personaId, text);
     for (let i = 0; i < reply.length;) {
@@ -461,6 +495,16 @@ export function createMockTransport() {
       i += size;
       step(() => pushEvent(gen, "text_delta", { delta: chunk }));
     }
+
+    // T4：stats 事件（上下文统计），终态前发一次
+    step(() => pushEvent(gen, "stats", {
+      cache_rate: 0.87,
+      context_tokens: 12400,
+      max_context_tokens: null,
+      input_cached: 10788,
+      input_other: 1612,
+      output: 512,
+    }));
 
     // 终态：done
     schedule(gen, cursor + 200, () => {
@@ -486,6 +530,9 @@ export function createMockTransport() {
         }];
       }
       assistant.usage = { output: Math.max(1, Math.floor(reply.length / 2)), total: 800 };
+      // media 事件附件同步落历史（与真后端一致：终态消息携带流中附件，
+      // done 重建后附件仍可见，预览不至于只在毫秒级窗口闪现）
+      assistant.attachments = [mediaEventAttachment()];
       historyOf(gen.cid).push(assistant);
       closeGen(gen);
     });
@@ -499,7 +546,15 @@ export function createMockTransport() {
       return { status: "ok", plugin: "astrbot_plugin_webui", version: MOCK_VERSION };
     }
     if (endpoint === "personas") return seed.personas;
-    if (endpoint === "conversations") return seed.conversations;
+    if (endpoint === "conversations") {
+      // REST 契约：非 legacy 项带 gen_id（busy 时为进行中 gen_id，否则 null）
+      return {
+        conversations: seed.conversations.conversations.map((convo) => ({
+          ...convo,
+          gen_id: convo.busy ? (runningGenForCid(convo.cid)?.genId ?? null) : null,
+        })),
+      };
+    }
     if (endpoint === "ui/settings") {
       // 模拟宿主 GET：设置 JSON 不存头像，从“文件层”回填 data URL
       return { settings: { ...mockUiSettings, ...mockAvatarFiles } };

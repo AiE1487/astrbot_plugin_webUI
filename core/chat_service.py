@@ -10,7 +10,7 @@
 - 同会话 single-flight：发送前检查该 cid 是否有进行中任务，有则 409
   session_busy；全局并发上限实时读配置 ``max_concurrent_generations``，满则
   409 concurrency_limit；
-- SSE 事件（契约不变）：reasoning_delta/text_delta/tool_call/tool_result/
+- SSE 事件：reasoning_delta/text_delta/tool_call/tool_result/media/stats/
   done{message_id,usage}/stopped/error；seq 从 0 单调、订阅即全量重放；
 - **stop 先落 stopped 终态**再 ``request_agent_stop_all(umo)`` 优雅中止，
   **不再 cancel 消费任务**（等 end 帧自然收尾，部分回复照常落平台历史）；

@@ -23,7 +23,8 @@
 - **bot 侧媒体帧**（宿主发出 image/file/record/video 时已自行落盘
   ``data/attachments/`` 且宿主不注册 db，webchat_event.py:114-183 实源）：
   ``register_host_attachment`` 解析文件名 -> ``db.insert_attachment`` 注册 ->
-  写插件索引 -> 返回消息 part（与上传通道共用同一索引）；
+  写插件索引 -> 返回消息 part + 契约 meta（与上传通道共用同一索引；索引
+  kind 归一 image|file，image 帧生成缩略 preview）；
 - 生命周期：upload 即登记（未引用）；被 send 引用后绑定 cid；删除会话级联
   清索引与文件；未被引用孤儿 24h 后由 asyncio 后台任务清理（main.terminate
   时取消该任务）；
@@ -463,15 +464,22 @@ async def register_host_attachment(
 
     宿主发媒体帧时已把文件写入 ``data/attachments/<stored_name>`` 且不注册 db
     （webchat_event.py:114-183 实源）；本函数补 ``db.insert_attachment`` 注册 +
-    插件索引（与上传通道共用同一索引），返回消息 part
-    ``{"type", "attachment_id", "filename"}``。
+    插件索引（与上传通道共用同一索引），同时返回消息 part 与契约 meta：
+    part ``{"type", "attachment_id", "filename"}``（历史落库形状与 v0.2 完全
+    一致）；meta = ``public_meta`` 形状 ``{file_id, kind, name, size, mime,
+    preview?}``——索引 kind 归一为契约二值（image→"image"，
+    record/video/file→"file"），name 优先 display_name（file 帧原始名）否则
+    存储文件名；image 帧复用 ``_image_preview`` 生成缩略（失败/无 PIL 时
+    None，public_meta 省略该键）。
 
     本函数经 pipeline_bridge 排水循环逐帧调用：同步磁盘 IO（附件区就绪
-    mkdir / is_file / stat / resolve / mime 猜测）打包进 ``asyncio.to_thread``
-    （对齐同模块 ``store_upload`` 既有做法），事件循环内不做阻塞 IO。
+    mkdir / is_file / stat / resolve / mime 猜测 / PIL 缩略）打包进
+    ``asyncio.to_thread``（对齐同模块 ``store_upload`` 既有做法），事件循环内
+    不做阻塞 IO。
 
     Returns:
-        消息 part；文件不存在返回 None（调用方跳过，不炸流）。
+        ``{"part": <消息 part>, "meta": <契约附件元数据>}``；文件不存在返回
+        None（调用方跳过，不炸流）。
     """
     if not stored_name:
         return None
@@ -484,15 +492,20 @@ async def register_host_attachment(
     attachment = await insert_db_attachment(context, disk_path, frame_type, mime_type)
     attachment_id = str(getattr(attachment, "attachment_id", "") or "")
     filename = display_name or disk_path.name
+    kind = "image" if frame_type == "image" else "file"
+    if frame_type == "image":
+        preview = await asyncio.to_thread(_image_preview, disk_path)
+    else:
+        preview = None
 
     meta = {
         "file_id": f"f_{uuid.uuid4().hex}",
         "attachment_id": attachment_id,
-        "kind": frame_type,
+        "kind": kind,
         "name": filename,
         "size": size,
         "mime": mime_type,
-        "preview": None,
+        "preview": preview,
         "truncated": False,
         "path": path_posix,
         "cid": cid,
@@ -503,12 +516,13 @@ async def register_host_attachment(
             index = await _load_index(data_dir)
             index["files"][meta["file_id"]] = meta
             await _save_index(data_dir, index)
-    return {
+    part = {
         "type": frame_type,
         "attachment_id": attachment_id,
         "filename": filename,
         **({"stored_filename": disk_path.name} if filename != disk_path.name else {}),
     }
+    return {"part": part, "meta": public_meta(meta)}
 
 
 async def find_by_attachment_id(data_dir: Path, attachment_id: str) -> dict | None:

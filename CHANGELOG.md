@@ -1,5 +1,54 @@
 # 更新日志
 
+## v0.4.0（2026-11-21）
+
+多功能特性集（前后端，7 项）：多轮防抖合并发送、LLM 媒体实时上屏、后台回复
+恢复、思考自动滚底、非流式配置适配、缓存/上下文统计栏、工具调用默认折叠。
+
+- **多轮防抖合并发送**：输入区发送按钮左侧新增「并入下一条」按钮（手写 merge
+  SVG 图标）——生成中（busy）也可把当前输入文本 + 就绪附件并入按会话的合并
+  队列，队列消息以「待合并」徽标上屏、可单独移除；按原发送按钮/Enter 时队列
+  各项与当前输入按空行拼接、附件拼接到队尾一次发出。合并发生在 composer 组装
+  层，`sendMessage` 签名不变；成功后清队列、失败保留可重试。
+- **LLM 媒体实时上屏**：back_queue 媒体帧（image/record/video/file，LLM 经
+  send_message_to_user 发图/发文件）注册成功后逐帧发 SSE `media` 事件（载荷
+  `{"attachment": public_meta}`，kind 归一 image|file，image 帧带 PIL 缩略
+  preview）；前端流式占位内按 file_id 去重增量渲染附件，done 后透传进终态
+  消息。任意后缀/无后缀文件按 file 卡片（名称/大小/mime）展示，图片可点开
+  lightbox 预览。历史 part 与 save_bot_history 行为零变化。
+- **后台回复支持**：`GET conversations` 非 legacy 项新增 `gen_id`（busy 时为
+  进行中的 gen_id）；前端装载会话列表后对 busy 且有 gen_id 且本地无活跃 gen
+  的会话自动 `setActiveGen` + `restoreStream`——关标签页/换浏览器回来不依赖
+  sessionStorage 即可恢复订阅续流（服务端缓冲保留 ≥5 分钟，TTL 过期流 404
+  时补拉一次最新历史 + 横幅提示）。生成任务本就在服务端与连接解耦，关闭窗口
+  不中断生成。
+- **思考内容自动滚到最新**：流式展开态（含手动点开）每次增量把
+  `.reasoning-body` 滚到底（该容器本就有 max-height:320px + overflow-y:auto）。
+- **非流式配置适配**：新增 `read_streaming_response(context)` 回读宿主
+  `provider_settings.streaming_response`（桩/缺失兜底 True）作为注入
+  `flags.enable_streaming`——原硬编码 True 等于强制流式，覆盖宿主配置；
+  `GET config` 新增 `streaming_response` 透传；前端 `state.streamingResponse`
+  装载，为 false 时流式占位等待行显示「{人格名} 正在回复中」。**升级行为
+  变化**：宿主 `provider_settings.streaming_response` 默认 False，升级后插件
+  默认显示「{人格名} 正在回复中」、回复生成完成后整段上屏，需逐字流式的
+  用户请在宿主配置开启该项；官方 WebChat 不发送 enable_streaming（webchat
+  场景恒流式），本插件与其语义有意不同。
+- **缓存/上下文统计栏**：agent_stats 帧现额外发 SSE `stats` 事件
+  `{cache_rate, context_tokens, max_context_tokens, input_cached, input_other,
+  output}`（cache_rate = input_cached/(input_cached+input_other)，分母 0 为
+  null；max_context_tokens 现阶段恒 null——宿主 per-provider
+  max_context_tokens 不随 AgentStats 帧携带，前端有 noMax 兜底文案）；
+  composer 顶部新增 `.stats-bar` 窄横栏（20px/11px/tabular-nums，:empty
+  隐藏），显示「缓存 87% · 上下文 12.4k」。
+- **工具调用默认折叠**：`createToolPanel` isOpen 初始 false，并移除 update()
+  的自动开合逻辑（手动开合保留，RUNNING/DONE 头部可见）。
+- **兼容性**：新增 SSE 事件类型 `media`/`stats` 与 REST 字段
+  （`conversations[].gen_id`、`config.streaming_response`）均为增量字段，
+  对独立端口与 bridge 两条传输链路无破坏性变更，旧前端忽略未知事件/字段。
+- **i18n**：新增 `composer.mergeTip/queuedBadge/queuedRemove/replying` 与
+  `stats.cache/context/contextNoMax`，zh/en 双语字典与 `.astrbot-plugin/i18n/`
+  两侧键集合对齐；selftest 共 342 项断言全过。
+
 ## v0.3.6（2026-11-15）
 
 用户显示名可自定义 + 宿主「用户识别」联动（前后端，1 新端点）。

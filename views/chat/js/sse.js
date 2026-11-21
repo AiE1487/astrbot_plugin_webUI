@@ -38,6 +38,9 @@ const TERMINAL_TYPES = new Set(["done", "stopped"]);
  * @property {(genId: string, type: "done"|"stopped"|"error", data: any) => void} onTerminal 终态
  * @property {(genId: string, state: StreamState) => void} [onState] 订阅状态变化
  * @property {(genId: string) => void} [onGone] 404 / 缓冲过期（终局，不再重试）
+ * @property {(genId: string) => void} [onReset] 每次订阅开始时通知，供上层重置流式
+ *   积累状态——服务端从 seq=0 全量重放，重放即重建（断线重连/切回会话时上层
+ *   已积累的 text/tools/attachments 若不清空会被重放事件重复累加）
  */
 
 /**
@@ -72,6 +75,9 @@ export function createStreamManager(transport, callbacks) {
       const generation = this.generations;
       // 每次订阅前先退订旧通道（bridge）或 abort 旧 fetch（standalone/mock）
       await this.teardownSubscription();
+      // 通知上层重置流式积累状态：服务端将从 seq=0 全量重放，重放即重建，
+      // 上层旧积累（text/tools/attachments 等）不清空会被重放事件重复累加
+      callbacks.onReset?.(this.genId);
       // 重置游标：服务端将从 seq=0 全量重放
       this.appliedSeq = -1;
       this.pending.clear();

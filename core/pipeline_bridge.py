@@ -17,8 +17,9 @@
   plain+chain_type="reasoning" -> reasoning_delta；plain 无 chain_type 且
   streaming -> text_delta；plain+tool_call（data=JSON 串）-> tool_call{start}；
   plain+tool_call_result -> tool_result{result|error 互斥, elapsed_ms=本地计时}；
-  plain+agent_stats -> 暂存 usage；image/file/record/video 帧（宿主已落盘
-  ``data/attachments/``，宿主不注册 db）-> 插件注册 db 附件 + 插件索引；
+  plain+agent_stats -> stats 事件（缓存率/上下文 token）+ 暂存 usage；
+  image/file/record/video 帧（宿主已落盘 ``data/attachments/``，宿主不注册
+  db）-> 插件注册 db 附件 + 插件索引 + media 事件（契约 meta 实时上屏）；
   end -> bot 历史落库后 done{message_id, usage}；
 - LLM 错误语义（与官方 WebChat 一致）：provider 错误以 bot 文本透传，不再有
   插件侧 fatal error 事件；本模块只对**传输层异常**（空闲超时、排水循环崩溃）
@@ -322,6 +323,31 @@ def _parse_json_object(raw_text: str) -> dict | None:
 # ---------------------------------------------------------------------------
 
 
+def read_streaming_response(context: Context) -> bool:
+    """读宿主流式配置 ``provider_settings.streaming_response``（default.py:161）。
+
+    宿主 agent 子阶段在 ``event.get_extra("enable_streaming")`` 非 None 时以
+    注入 flags **覆盖**该配置（internal.py:176-177 / third_party.py:355 实源），
+    因此注入前必须回读真实配置值，不能再无条件强制流式。
+
+    Args:
+        context: 宿主上下文（``context.get_config()`` 即全局配置）。
+
+    Returns:
+        配置的 bool 值；桩环境/宿主缺失（无 ``get_config``）、键缺失或非 bool
+        一律兜底 ``True``。本插件按宿主 ``provider_settings.streaming_response``
+        适配（v0.4.0 起有意行为；宿主默认 False → 插件默认非流式，UI 显示
+        「正在回复中」，回复完成后整段上屏）；官方 Dashboard WebChat 不发送
+        ``enable_streaming``（webchat 场景恒流式），本插件与其语义有意不同。
+    """
+    try:
+        config = context.get_config() or {}
+        value = config.get("provider_settings", {}).get("streaming_response")
+    except Exception:  # noqa: BLE001 —— 桩环境/宿主缺失
+        return True
+    return value if isinstance(value, bool) else True
+
+
 def strip_message_parts_path_fields(message_parts: list[dict]) -> list[dict]:
     """剥掉 parts 的 ``path`` 字段（宿主落库同款，message_parts_helper.py:57）。"""
     return [{k: v for k, v in part.items() if k != "path"} for part in message_parts if isinstance(part, dict)]
@@ -362,7 +388,8 @@ async def inject_user_message(
         )
         # ② back_queue（按位置传参：request_id, conversation_id）
         back_queue = mgr.get_or_create_back_queue(gen_id, cid)
-        # ③ 会话队列注入（tuple 形状同宿主 chat_service.py:1366-1385）
+        # ③ 会话队列注入（tuple 形状同宿主 chat_service.py:1366-1385）；
+        #    enable_streaming 回读宿主配置（read_streaming_response），enable_reasoning 恒开
         chat_queue = mgr.get_or_create_queue(cid)
         await chat_queue.put(
             (
@@ -370,7 +397,10 @@ async def inject_user_message(
                 cid,
                 {
                     "message": parts,
-                    "flags": {"enable_streaming": True, "enable_reasoning": True},
+                    "flags": {
+                        "enable_streaming": read_streaming_response(context),
+                        "enable_reasoning": True,
+                    },
                     "message_id": gen_id,
                     "llm_checkpoint_id": checkpoint,
                 },
@@ -465,6 +495,34 @@ def usage_from_agent_stats(agent_stats: dict | None) -> dict:
     return {"output": output, "total": total}
 
 
+def stats_from_agent_stats(agent_stats: dict | None) -> dict:
+    """agent_stats（AgentStats.to_dict()）-> 契约 stats 统计事件载荷。
+
+    ``cache_rate = input_cached / (input_cached + input_other)``（分母 0 ->
+    None，前端显示「不适用」）；``context_tokens`` = AgentStats.
+    current_context_tokens（最近一次 LLM 请求的输入 token 数，response.py:23
+    实源）；``max_context_tokens`` 恒 ``None``：宿主 provider 配置确有
+    ``max_context_tokens`` 字段（tool_loop_agent_runner.py:252 经
+    ``provider.provider_config`` 读取），但 AgentStats 帧不携带该值，consume
+    期解析当前会话选中的 provider 需额外 umo 绑定查询且随模型元数据自动填充
+    （0 = 未知），无可靠单帧来源故不硬造（前端有 noMax 兜底文案）。
+    """
+    stats = agent_stats if isinstance(agent_stats, dict) else {}
+    token_usage = stats.get("token_usage")
+    token_usage = token_usage if isinstance(token_usage, dict) else {}
+    input_cached = _to_int(token_usage.get("input_cached"))
+    input_other = _to_int(token_usage.get("input_other"))
+    denominator = input_cached + input_other
+    return {
+        "cache_rate": (input_cached / denominator) if denominator else None,
+        "context_tokens": _to_int(stats.get("current_context_tokens")),
+        "max_context_tokens": None,
+        "input_cached": input_cached,
+        "input_other": input_other,
+        "output": _to_int(token_usage.get("output")),
+    }
+
+
 def _to_int(value) -> int:
     try:
         return int(value or 0)
@@ -553,7 +611,12 @@ async def consume_generation(
 
             if chain_type == "agent_stats":
                 agent_stats = _parse_json_object(str(data)) or {}
-                continue  # 暂存 usage，done 事件使用；不产 SSE 事件
+                # 暂存 usage（done 事件使用）之外实时上屏统计（缓存率/上下文
+                # token）；坏 JSON/空 dict 不 emit——stats_from_agent_stats({})
+                # 是全零 stats，前端会渲染「上下文 0」（暂存逻辑不变，空 dict 照旧存储）
+                if agent_stats:
+                    emit("stats", stats_from_agent_stats(agent_stats))
+                continue
 
             if frame_type == "plain":
                 text = data if isinstance(data, str) else str(data or "")
@@ -594,21 +657,24 @@ async def consume_generation(
                             body["result"] = result_text
                         emit("tool_result", body)
                 else:
-                    # 正文：streaming 增量；无 chain_type 的非流式整段按防御也走
-                    # text_delta（注入恒 enable_streaming=true，非流式帧理论上不出现）
+                    # 正文：streaming 增量；enable_streaming 回读宿主
+                    # provider_settings.streaming_response，宿主关闭流式时非流式
+                    # 整段帧走此分支（全文一次 text_delta）
                     accumulator.add_plain(text, chain_type=None, streaming=streaming)
                     if text:
                         emit("text_delta", {"delta": text})
             elif frame_type in _MEDIA_FRAME_PREFIXES:
                 # 宿主已自行落盘 data/attachments/（webchat_event.py:114-183 实源，
                 # 宿主不注册 db）：插件解析文件名 -> db.insert_attachment -> 插件索引
+                # -> 历史 part + 契约 meta（media 事件实时上屏，前端生成期间可见）
                 stored_name, display_name = _split_media_payload(frame_type, data)
-                part = await register_media_frame(
+                registered = await register_media_frame(
                     context, cid, frame_type, stored_name, display_name,
                     data_dir=data_dir, cid_bind=cid_bind,
                 )
-                if part is not None:
-                    accumulator.add_part(part)
+                if registered is not None:
+                    accumulator.add_part(registered["part"])
+                    emit("media", {"attachment": registered["meta"]})
             elif frame_type == "actionrow" and isinstance(data, dict):
                 accumulator.add_part({"type": "actionrow", **data})  # 历史忠实（无 SSE 映射）
             elif frame_type == "end":
@@ -648,15 +714,16 @@ async def register_media_frame(
     data_dir: Path | None = None,
     cid_bind: str | None = None,
 ) -> dict | None:
-    """把宿主已落盘的 bot 媒体文件注册进 db 与插件索引，返回消息 part。
+    """把宿主已落盘的 bot 媒体文件注册进 db 与插件索引，返回 part + 契约 meta。
 
     宿主发媒体帧时已把文件写入 ``data/attachments/<stored_name>`` 并**不注册
     db**（webchat_event.py:114-183 实源）；插件补注册（等同官方
     ``create_attachment_part_from_existing_file`` 行为，message_parts_helper.py:423-457）。
 
     Returns:
-        ``{"type", "attachment_id", "filename"}`` part；文件缺失/注册失败返回
-        None（不炸流）。
+        ``{"part": {"type","attachment_id","filename"}, "meta": {file_id,kind,
+        name,size,mime,preview?}}``（meta 为 public_meta 形状，供 media 事件
+        实时上屏）；文件缺失/注册失败返回 None（不炸流）。
     """
     if not stored_name:
         return None

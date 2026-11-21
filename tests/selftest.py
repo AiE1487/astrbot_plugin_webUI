@@ -16,14 +16,16 @@
     usage / 媒体 parts→attachments 索引反查）、分页语义（page 1 最新、页内旧->新、
     has_more 配 count）、legacy 归档响应附 legacy:true、级联/legacy 删除分支；
   - D：生成内核「注入-排水」——注入三步形状（平台历史剥 path / back_queue /
-    会话队列 tuple / flags / checkpoint 同源）、翻译表逐型（text_delta /
-    reasoning_delta / tool_call{start} / tool_result{result|error 互斥 +
-    elapsed_ms} / agent_stats→done.usage / end→bot 落库→done{message_id,usage}）、
+    会话队列 tuple / flags（enable_streaming 回读宿主配置）/ checkpoint 同源）、
+    翻译表逐型（text_delta / reasoning_delta / tool_call{start} /
+    tool_result{result|error 互斥 + elapsed_ms} / agent_stats→stats 事件 +
+    done.usage / 媒体帧→media 事件上屏 / end→bot 落库→done{message_id,usage}）、
     坏载荷防御（坏 JSON / 非 dict / message_id 不匹配 / 冗余帧不产事件）、
     空闲超时兜底（注入短超时）、remove_back_queue 纪律（正常 / 异常 / 取消 /
     shutdown）、stop 先落 stopped + request_agent_stop_all(umo) + 消费任务不被
     cancel 且部分回复落平台历史、single-flight 409 / 并发上限 409（配置热生效）、
-    bot 媒体帧 db 注册 + 索引 + 助手 attachments（缺文件防御）、并发 send 竞态
+    bot 媒体帧 db 注册 + 索引 + media 事件 + 助手 attachments（缺文件防御）、
+    流式配置适配（read_streaming_response / config 端点透传）、并发 send 竞态
     （TOCTOU）、删除生成中会话（取消先行，已删历史不复活）；
   - J6：SSE 保活 ping（不占业务 seq）；
   - H：附件（宿主附件区落盘 + db 注册 + 索引 f_id↔attachment_id + 白名单 /
@@ -438,6 +440,11 @@ def _stub_registry():
     from astrbot.core.utils.active_event_registry import active_event_registry
 
     return active_event_registry
+
+
+def _cfg_ctx(config):
+    """构造带 get_config 的最小 context（read_streaming_response 断言用）。"""
+    return SimpleNamespace(get_config=lambda: config)
 
 
 def set_stub_host_data(sandbox: Path) -> Path:
@@ -856,10 +863,10 @@ async def _test_chat_happy_path() -> None:
     await asyncio.wait_for(entry["task"], timeout=10)
 
     events = [e["event"] for e in entry["buffer"]]
-    check("D1-10 翻译表逐型", events == ["reasoning_delta", "text_delta", "tool_call", "tool_result", "text_delta", "done"], str(events))
-    check("D1-11 seq 从 0 单调", [e["data"]["seq"] for e in entry["buffer"]] == list(range(6)))
+    check("D1-10 翻译表逐型", events == ["reasoning_delta", "text_delta", "tool_call", "tool_result", "text_delta", "stats", "done"], str(events))
+    check("D1-11 seq 从 0 单调", [e["data"]["seq"] for e in entry["buffer"]] == list(range(7)))
     check("D1-12 delta 内容", (entry["buffer"][0]["data"]["delta"], entry["buffer"][1]["data"]["delta"], entry["buffer"][4]["data"]["delta"]) == ("思考中", "今天", "晴"))
-    check("D1-13 坏载荷/不匹配/冗余帧不产事件", len(entry["buffer"]) == 6)
+    check("D1-13 坏载荷/不匹配/冗余帧不产事件", len(entry["buffer"]) == 7)
     tool_call = entry["buffer"][2]["data"]
     check("D1-14 tool_call 契约", tool_call == {"seq": tool_call["seq"], "phase": "start", "id": "c1", "name": "get_weather", "args": {"city": "北京"}}, str(tool_call))
     tool_result = entry["buffer"][3]["data"]
@@ -869,7 +876,13 @@ async def _test_chat_happy_path() -> None:
         and "error" not in tool_result and isinstance(tool_result.get("elapsed_ms"), int) and tool_result["elapsed_ms"] >= 0,
         str(tool_result),
     )
-    done = entry["buffer"][5]["data"]
+    stats_evt = entry["buffer"][5]["data"]
+    check(
+        "D1-32 stats 事件字段（cache_rate/context_tokens/max=None）",
+        stats_evt == {"seq": stats_evt["seq"], "cache_rate": 0.4, "context_tokens": 10, "max_context_tokens": None, "input_cached": 2, "input_other": 3, "output": 5},
+        str(stats_evt),
+    )
+    done = entry["buffer"][6]["data"]
     bot_rows = [r for r in hm.rows if r.content.get("type") == "bot"]
     check("D1-16 done.usage 来自 agent_stats", done["usage"] == {"output": 5, "total": 10}, str(done))
     check("D1-17 done.message_id=平台行号同源", len(bot_rows) == 1 and done["message_id"] == f"m_{bot_rows[0].id}")
@@ -1053,7 +1066,7 @@ async def _test_chat_queue_discipline() -> None:
 
 
 async def _test_chat_media_frames() -> None:
-    print("== D7. bot 媒体帧：db 注册 + 索引 + 助手 attachments；缺文件防御 ==")
+    print("== D7. bot 媒体帧：db 注册 + 索引 + media 事件上屏 + 助手 attachments；缺文件防御 ==")
     chat_service._GENERATIONS.clear()
     sandbox = fresh_sandbox()
     hostdir = set_stub_host_data(sandbox) / "attachments"
@@ -1062,38 +1075,113 @@ async def _test_chat_media_frames() -> None:
     cid = (await conversation_service.create_conversation(plugin.context, None, None))["cid"]
     (hostdir / "bot_pic.png").write_bytes(b"pngdata")
     (hostdir / "store.bin").write_bytes(b"bindata")
+    (hostdir / "bot_voice.wav").write_bytes(b"wavdata")
     db_count_before = len(plugin.context.db.attachments)
 
-    gen_id = await chat_service.start_generation(plugin, cid, "发图给我")
-    frames = [
-        {"type": "image", "data": "[IMAGE]bot_pic.png", "streaming": True, "message_id": gen_id},
-        {"type": "file", "data": "[FILE]store.bin|原始名.bin", "streaming": True, "message_id": gen_id},
-        {"type": "image", "data": "[IMAGE]missing.png", "streaming": True, "message_id": gen_id},  # 缺文件防御
-        {"type": "end", "data": "", "streaming": False, "message_id": gen_id},
-    ]
-    await feed_frames(gen_id, frames)
-    entry = chat_service._GENERATIONS[gen_id]
-    await asyncio.wait_for(entry["task"], timeout=10)
+    # D7-8/D7-11 的「preview 键省略」断言与运行环境有无 Pillow 解耦：替身恒返
+    # None（真 _image_preview 在装有 PIL 的机器上可能产出 preview data URL，
+    # public_meta 会带上该键，断言结果将随环境漂移）；finally 还原
+    original_image_preview = attachment_service._image_preview
+    attachment_service._image_preview = lambda path: None
+    try:
+        gen_id = await chat_service.start_generation(plugin, cid, "发图给我")
+        frames = [
+            {"type": "image", "data": "[IMAGE]bot_pic.png", "streaming": True, "message_id": gen_id},
+            {"type": "file", "data": "[FILE]store.bin|原始名.bin", "streaming": True, "message_id": gen_id},
+            {"type": "record", "data": "[RECORD]bot_voice.wav", "streaming": True, "message_id": gen_id},
+            {"type": "image", "data": "[IMAGE]missing.png", "streaming": True, "message_id": gen_id},  # 缺文件防御
+            {"type": "end", "data": "", "streaming": False, "message_id": gen_id},
+        ]
+        await feed_frames(gen_id, frames)
+        entry = chat_service._GENERATIONS[gen_id]
+        await asyncio.wait_for(entry["task"], timeout=10)
+    finally:
+        attachment_service._image_preview = original_image_preview
     db = plugin.context.db
 
-    check("D7-1 媒体帧注册 db（缺文件跳过）", len(db.attachments) == db_count_before + 2, str(db.attachments))
-    atts = list(db.attachments.values())[-2:]
-    check("D7-2 db type/落盘路径", {a.type for a in atts} == {"image", "file"} and all(a.path.startswith(str(hostdir)) for a in atts), str(atts))
+    check("D7-1 媒体帧注册 db（缺文件跳过）", len(db.attachments) == db_count_before + 3, str(db.attachments))
+    atts = list(db.attachments.values())[-3:]
+    check("D7-2 db type/落盘路径", {a.type for a in atts} == {"image", "file", "record"} and all(a.path.startswith(str(hostdir)) for a in atts), str(atts))
     bot_rows = [r for r in plugin.context.message_history_manager.rows if r.content.get("type") == "bot"]
-    media_parts = [p for p in bot_rows[0].content["message"] if p["type"] in ("image", "file")] if bot_rows else []
-    check("D7-3 bot parts 含媒体段（attachment_id）", len(media_parts) == 2 and all(p.get("attachment_id") for p in media_parts), str(media_parts))
+    media_parts = [p for p in bot_rows[0].content["message"] if p["type"] in ("image", "file", "record")] if bot_rows else []
+    check("D7-3 bot parts 含媒体段（attachment_id）", len(media_parts) == 3 and all(p.get("attachment_id") for p in media_parts), str(media_parts))
     file_part = next((p for p in media_parts if p["type"] == "file"), {})
     check("D7-4 file 展示名/stored_filename", file_part.get("filename") == "原始名.bin" and file_part.get("stored_filename") == "store.bin", str(file_part))
     result = await conversation_service.page_history(plugin.context, sandbox, cid, 1, 30)
     bot_msg = result["messages"][-1]
     check(
-        "D7-5 助手 attachments 索引反查",
-        [a["kind"] for a in bot_msg.get("attachments") or []] == ["image", "file"]
-        and bot_msg["attachments"][0]["name"] == "bot_pic.png" and bot_msg["attachments"][1]["name"] == "原始名.bin",
+        "D7-5 助手 attachments 索引反查（record kind 归一 file）",
+        [a["kind"] for a in bot_msg.get("attachments") or []] == ["image", "file", "file"]
+        and bot_msg["attachments"][0]["name"] == "bot_pic.png"
+        and bot_msg["attachments"][1]["name"] == "原始名.bin"
+        and bot_msg["attachments"][2]["name"] == "bot_voice.wav",
         str(bot_msg.get("attachments")),
     )
-    check("D7-6 媒体帧不产 SSE 事件（仅 done）", [e["event"] for e in entry["buffer"]] == ["done"])
-    check("D7-7 队列已清理", gen_id not in _stub_queue_mgr().back_queues)
+    # media 事件：注册成功逐帧 emit（缺文件帧不发），载荷 = {"attachment": 契约 meta}
+    media_events = [e for e in entry["buffer"] if e["event"] == "media"]
+    check("D7-6 media 事件逐帧上屏（仅 done 终态）", [e["event"] for e in entry["buffer"]] == ["media", "media", "media", "done"], str([e["event"] for e in entry["buffer"]]))
+    check("D7-6b media 载荷形状 {seq, attachment}", all(set(e["data"].keys()) == {"seq", "attachment"} for e in media_events), str(media_events))
+    pub = [e["data"]["attachment"] for e in media_events]
+    check("D7-8 image 帧 kind/name + preview 缺省省略", pub[0]["kind"] == "image" and pub[0]["name"] == "bot_pic.png" and "preview" not in pub[0], str(pub[0]))
+    check("D7-9 file 帧 kind/name（display 优先）", pub[1]["kind"] == "file" and pub[1]["name"] == "原始名.bin", str(pub[1]))
+    check("D7-10 record 帧 kind 归入 file/name 存储名", pub[2]["kind"] == "file" and pub[2]["name"] == "bot_voice.wav", str(pub[2]))
+    check(
+        "D7-11 契约键集合 {file_id,kind,name,size,mime}",
+        all(set(a.keys()) == {"file_id", "kind", "name", "size", "mime"} for a in pub)
+        and all(a["file_id"].startswith("f_") and a["size"] > 0 for a in pub),
+        str(pub),
+    )
+    check("D7-12 media 与历史 attachments 同名同源", [a["name"] for a in pub] == [a["name"] for a in bot_msg.get("attachments") or []], str(pub))
+    check("D7-13 队列已清理", gen_id not in _stub_queue_mgr().back_queues)
+
+
+async def _test_streaming_flags() -> None:
+    print("== D10. 流式配置适配（注入 flags 回读宿主配置 + config 端点透传）==")
+    chat_service._GENERATIONS.clear()
+    mgr = _stub_queue_mgr()
+    sandbox = fresh_sandbox()
+    plugin = make_plugin(sandbox)
+    cid = (await conversation_service.create_conversation(plugin.context, None, None))["cid"]
+
+    # streaming_response=False：注入 flags.enable_streaming 必须为 False（宿主覆盖语义）
+    plugin.context.get_config = lambda: {"provider_settings": {"streaming_response": False}}
+    gen1 = uuid.uuid4().hex
+    inj = await pipeline_bridge.inject_user_message(
+        plugin.context, cid, [{"type": "plain", "text": "非流式"}], gen1
+    )
+    payload1 = await asyncio.wait_for(mgr.queues[cid].get(), timeout=2)
+    check("D10-1 关流式 flags.enable_streaming=False", payload1[2]["flags"] == {"enable_streaming": False, "enable_reasoning": True}, str(payload1[2]["flags"]))
+    check("D10-2 注入返回 back_queue/checkpoint", inj["back_queue"] is mgr.back_queues[gen1] and isinstance(inj["llm_checkpoint_id"], str) and inj["llm_checkpoint_id"] == payload1[2]["llm_checkpoint_id"])
+
+    # streaming_response=True / 键缺失 / 桩无 get_config：True
+    plugin.context.get_config = lambda: {"provider_settings": {"streaming_response": True}}
+    gen2 = uuid.uuid4().hex
+    await pipeline_bridge.inject_user_message(plugin.context, cid, [{"type": "plain", "text": "流式"}], gen2)
+    payload2 = await asyncio.wait_for(mgr.queues[cid].get(), timeout=2)
+    check("D10-3 开流式 flags.enable_streaming=True", payload2[2]["flags"]["enable_streaming"] is True, str(payload2[2]["flags"]))
+    plugin.context.get_config = lambda: {}
+    gen3 = uuid.uuid4().hex
+    await pipeline_bridge.inject_user_message(plugin.context, cid, [{"type": "plain", "text": "缺键"}], gen3)
+    payload3 = await asyncio.wait_for(mgr.queues[cid].get(), timeout=2)
+    check("D10-4 键缺失兜底 True", payload3[2]["flags"]["enable_streaming"] is True)
+    del plugin.context.get_config  # 桩无 get_config（属性级兜底路径）
+    gen4 = uuid.uuid4().hex
+    await pipeline_bridge.inject_user_message(plugin.context, cid, [{"type": "plain", "text": "无配置"}], gen4)
+    payload4 = await asyncio.wait_for(mgr.queues[cid].get(), timeout=2)
+    check("D10-5 桩无 get_config 兜底 True", payload4[2]["flags"]["enable_streaming"] is True)
+
+    # config 端点透传同源值（user_display_name 并存）
+    plugin.context.get_config = lambda: {"provider_settings": {"streaming_response": False}}
+    resp = await routes.handle_get_config(plugin)
+    check("D10-6 config 端点 streaming_response=False", resp["status"] == 200 and resp["data"]["streaming_response"] is False and resp["data"]["user_display_name"] == "USER", str(resp))
+    plugin.context.get_config = lambda: {"provider_settings": {}}
+    resp = await routes.handle_get_config(plugin)
+    check("D10-7 config 端点缺键兜底 True", resp["data"]["streaming_response"] is True)
+
+    for gen in (gen1, gen2, gen3, gen4):
+        pipeline_bridge.remove_back_queue(gen)
+    mgr.remove_queues(cid)
+    plugin.context.message_history_manager.rows.clear()
 
 
 async def _test_chat_concurrent_send() -> None:
@@ -1262,6 +1350,24 @@ def test_attachment_unit() -> None:
         and pipeline_bridge._split_media_payload("file", "[FILE]store.bin|原始名.bin") == ("store.bin", "原始名.bin")
         and pipeline_bridge._split_media_payload("record", "[RECORD]x.wav") == ("x.wav", None)
         and pipeline_bridge._split_media_payload("image", "[IMAGE]../evil.png") == ("evil.png", None),
+    )
+    check(
+        "H1-7 stats_from_agent_stats（cache_rate/字段/max=None）",
+        pipeline_bridge.stats_from_agent_stats(
+            {"token_usage": {"input_other": 3, "input_cached": 1, "output": 5}, "current_context_tokens": 42}
+        ) == {"cache_rate": 0.25, "context_tokens": 42, "max_context_tokens": None, "input_cached": 1, "input_other": 3, "output": 5}
+        and pipeline_bridge.stats_from_agent_stats(None) == {"cache_rate": None, "context_tokens": 0, "max_context_tokens": None, "input_cached": 0, "input_other": 0, "output": 0}
+        and pipeline_bridge.stats_from_agent_stats({"token_usage": "bad", "current_context_tokens": "9"})["cache_rate"] is None
+        and pipeline_bridge.stats_from_agent_stats({"token_usage": {}})["context_tokens"] == 0,
+    )
+    check(
+        "H1-8 read_streaming_response（配置回读与兜底）",
+        pipeline_bridge.read_streaming_response(_cfg_ctx({"provider_settings": {"streaming_response": False}})) is False
+        and pipeline_bridge.read_streaming_response(_cfg_ctx({"provider_settings": {"streaming_response": True}})) is True
+        and pipeline_bridge.read_streaming_response(_cfg_ctx({"provider_settings": {}})) is True
+        and pipeline_bridge.read_streaming_response(_cfg_ctx({})) is True
+        and pipeline_bridge.read_streaming_response(_cfg_ctx({"provider_settings": {"streaming_response": "yes"}})) is True
+        and pipeline_bridge.read_streaming_response(SimpleNamespace()) is True,  # 桩无 get_config
     )
 
 
@@ -1564,15 +1670,20 @@ def test_routes() -> None:
         resp = await call("/astrbot_plugin_webui/conversations", "POST")
         check("E12 非 JSON body 400", resp["status"] == 400 and resp["data"]["error"] == "invalid_request")
 
-        # conversations: list + busy
+        # conversations: list + busy + gen_id
         stub_request.set_json(None)
         resp = await call("/astrbot_plugin_webui/conversations", "GET")
         items = resp["data"]["conversations"]
-        check("E13 会话列表 busy 键", all(set(i.keys()) == {"cid", "title", "persona_id", "updated_at", "busy"} for i in items))
+        check("E13 会话列表 busy/gen_id 键", all(set(i.keys()) == {"cid", "title", "persona_id", "updated_at", "busy", "gen_id"} for i in items), str(items[0].keys() if items else None))
+        check("E13b 无任务时 gen_id null", all(i["gen_id"] is None and i["busy"] is False for i in items))
         chat_service._GENERATIONS["fake-gen"] = {"gen_id": "fake-gen", "cid": cid, "task": None, "buffer": sse.new_buffer(), "waiters": set(), "finished": False, "finished_at": None, "last_seq": -1}
         resp = await call("/astrbot_plugin_webui/conversations", "GET")
-        busy_map = {i["cid"]: i["busy"] for i in resp["data"]["conversations"]}
+        items = resp["data"]["conversations"]
+        busy_map = {i["cid"]: i["busy"] for i in items}
+        gen_map = {i["cid"]: i["gen_id"] for i in items}
         check("E14 busy=该 cid 有进行中任务", busy_map.get(cid) is True)
+        check("E14b 有任务项 gen_id 一致", gen_map.get(cid) == "fake-gen" and busy_map.get(cid) is True, str(gen_map))
+        check("E14c 其余会话 gen_id null", all(v is None for k, v in gen_map.items() if k != cid))
         chat_service._GENERATIONS.clear()
 
         # history（新会话读平台历史；桩 db 空历史 -> 空 messages）
@@ -1882,6 +1993,7 @@ def main() -> int:
     asyncio.run(_test_chat_idle_timeout())
     asyncio.run(_test_chat_queue_discipline())
     asyncio.run(_test_chat_media_frames())
+    asyncio.run(_test_streaming_flags())
     asyncio.run(_test_chat_concurrent_send())
     asyncio.run(_test_delete_while_generating())
     asyncio.run(_test_sse_ping())

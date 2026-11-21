@@ -6,6 +6,11 @@
  *   Enter 仍可用因 onSend 实时 canSend）。
  * - 停止 → POST stop/<gen_id> 后等 stopped 终态落 UI（契约：服务端先落终态再 cancel）。
  * - 409 双分支文案：session_busy / concurrency_limit。
+ * - 合并按钮（T1 多轮防抖合并发送）：busy 生成中把当前输入并入该会话的合并
+ *   队列（store.queueMessage）；发送时把队列各项 + 当前输入拼成一条消息一次发出
+ *   （sendMessage 签名不变，合并发生在 composer 组装层），成功后清空队列。
+ * - 统计栏（T4）：composer-inner 顶部 stats-bar，按 store.statsOf(当前 cid)
+ *   渲染缓存命中率与上下文用量（stats 事件驱动；无数据留空）。
  * - 附件：附件按钮 / 拖拽 / Ctrl+V 直接粘贴（W5）→ image/text 白名单过滤 →
  *   图片 canvas 压缩长边≤2048 再 upload（toBlob 异步完成后再提交 FormData）→
  *   预览条（缩略图/文件卡 + 可移除）→ 发送携 file_ids；upload 413/415 立即提示并阻断；
@@ -113,6 +118,9 @@ export function createComposer({ root, store, api, t }) {
   /** @type {Map<string, {meta?: any, file?: File, uploading: boolean, chip: HTMLElement, metaNode: HTMLElement, infoNode: HTMLElement, progressNode: HTMLElement | null, fillNode: HTMLElement | null}>} */
   const pending = new Map();
   const previewBar = el("div", { class: "attach-preview", "aria-label": "attachments" });
+
+  // 统计栏（T4）：stats 事件驱动，按当前会话渲染缓存命中率/上下文用量；无数据留空
+  const statsBar = el("div", { class: "stats-bar" });
 
   function refreshPreviewBar() {
     previewBar.classList.toggle("has-items", pending.size > 0);
@@ -366,6 +374,14 @@ export function createComposer({ root, store, api, t }) {
     onclick: () => onSend(),
   }, icon("send", { size: 16 }));
 
+  const mergeBtn = el("button", {
+    class: "merge-btn",
+    type: "button",
+    "aria-label": t("composer.mergeTip", "并入下一条（合并发送）"),
+    title: t("composer.mergeTip", "并入下一条（合并发送）"),
+    onclick: () => mergeIntoQueue(),
+  }, icon("merge", { size: 16 }));
+
   const stopBtn = el("button", {
     class: "stop-btn",
     type: "button",
@@ -374,7 +390,8 @@ export function createComposer({ root, store, api, t }) {
     onclick: () => onStop(),
   }, icon("stop", { size: 15 }));
 
-  const row = el("div", { class: "composer-row" }, attachBtn, textarea, sendBtn, stopBtn);
+  // DOM 顺序：attachBtn, textarea, mergeBtn, sendBtn, stopBtn（T1）
+  const row = el("div", { class: "composer-row" }, attachBtn, textarea, mergeBtn, sendBtn, stopBtn);
 
   const noteNode = el("span", { class: "cf-note" });
   const foot = el("div", { class: "composer-foot" }, noteNode);
@@ -410,14 +427,20 @@ export function createComposer({ root, store, api, t }) {
     return true;
   }
 
+  /** 当前输入是否有可发内容：非空文本或已就绪附件（不含合并队列）。 */
+  function hasReadyInput() {
+    const hasText = textarea.value.trim().length > 0;
+    const hasFiles = [...pending.values()].some((item) => item.meta);
+    return hasText || hasFiles;
+  }
+
   function canSend() {
     if (isLegacyConvo()) return false; // legacy 归档只读：禁发
     const cid = store.state.currentCid;
     if (sending || !attachmentsReady()) return false;
-    if (cid && store.isBusy(cid)) return false; // busy 禁发
-    const hasText = textarea.value.trim().length > 0;
-    const hasFiles = [...pending.values()].some((item) => item.meta);
-    return hasText || hasFiles;
+    if (cid && store.isBusy(cid)) return false; // busy 禁发（busy 时经合并按钮并入队列）
+    // T1：当前输入为空但合并队列非空时也允许发送（仅发队列）
+    return hasReadyInput() || store.queuedOf(cid).length > 0;
   }
 
   function updateButtons() {
@@ -426,6 +449,14 @@ export function createComposer({ root, store, api, t }) {
     const legacy = isLegacyConvo();
     textarea.disabled = legacy;
     attachBtn.disabled = legacy;
+    // 合并按钮（T1）：legacy / 发送中 / 无 cid / 无可并入内容（无文本且无就绪
+    // 附件）时禁用；busy 不禁并入——busy 时把输入并入队列正是排队场景。
+    // 不含 !attachmentsReady()：mergeIntoQueue 本就只挑 meta 就绪的附件并入，
+    // 上传中的附件保留在预览条，按钮无需因后台上传整体禁用（禁了即死路径）
+    mergeBtn.disabled = legacy
+      || sending
+      || !store.state.currentCid
+      || !hasReadyInput();
     // 说明条：选中 legacy 会话时显示；切走时若脚注仍是该说明则清空（不覆盖其它提示）
     if (legacy) {
       setNote(legacyNoticeText(), "warning");
@@ -443,21 +474,66 @@ export function createComposer({ root, store, api, t }) {
     );
   }
 
+  /**
+   * 合并按钮（T1）：把当前输入（文本 + 已就绪附件）并入当前会话的合并队列。
+   * busy 生成中也可并入（排队场景）；仍在上传中的附件不并入、保留在预览条。
+   */
+  function mergeIntoQueue() {
+    if (isLegacyConvo() || sending) return;
+    const cid = store.state.currentCid;
+    if (!cid) return;
+    const text = textarea.value.trim();
+    /** @type {any[]} */
+    const metas = [];
+    /** @type {string[]} */
+    const mergedKeys = [];
+    for (const [key, item] of pending.entries()) {
+      if (item.meta) {
+        metas.push(item.meta);
+        mergedKeys.push(key);
+      }
+    }
+    if (!text && metas.length === 0) return;
+    store.queueMessage(cid, { text, attachments: metas });
+    textarea.value = "";
+    autoGrow();
+    for (const key of mergedKeys) removePending(key); // removePending 内部会 updateButtons
+    textarea.focus();
+  }
+
   async function onSend() {
     if (!canSend()) return;
+    const cid = store.state.currentCid;
+    const queuedItems = cid ? store.queuedOf(cid).slice() : [];
     const text = textarea.value.trim();
     const attachments = [...pending.values()]
       .filter((item) => item.meta)
       .map((item) => /** @type {any} */ (item.meta));
-    if (!text && attachments.length === 0) return;
+    if (!text && attachments.length === 0 && queuedItems.length === 0) return;
+    // T1 合并发送：队列各项文本 + 当前输入按序以空行拼接，附件拼接在队尾；
+    // sendMessage 签名不变（合并发生在 composer 组装层）
+    const mergedText = [
+      ...queuedItems.map((item) => String(item?.text ?? "")),
+      text,
+    ].filter((part) => part).join("\n\n");
+    const mergedAttachments = [
+      ...queuedItems.flatMap((item) => (Array.isArray(item?.attachments) ? item.attachments : [])),
+      ...attachments,
+    ];
     sending = true;
     updateButtons();
     setNote(t("composer.sending", "发送中…"));
     try {
-      await store.sendMessage({ text, attachments });
+      await store.sendMessage({ text: mergedText, attachments: mergedAttachments });
       textarea.value = "";
       autoGrow();
       for (const key of [...pending.keys()]) removePending(key);
+      // 发送成功后清空该 cid 队列（失败保留，可重试；sending 期间合并按钮禁用，
+      // 队列内容即本次已合并发出的内容）
+      if (cid) {
+        const queuedCount = store.queuedOf(cid).length;
+        for (let i = queuedCount - 1; i >= 0; i -= 1) store.removeQueued(cid, i);
+      }
       setNote("");
     } catch (error) {
       // 409 双分支按 slug 先行判定（契约：session_busy 与 concurrency_limit 同为 409）；
@@ -548,17 +624,57 @@ export function createComposer({ root, store, api, t }) {
     updateButtons(); // 程序化改 value 不触发 input 事件，按钮态需手动重算
   }
 
+  /* ── 统计栏（T4） ───────────────────────────────────── */
+
+  /** token 数格式化：千位以下原样，≥10000 显示 "12.3k"。@param {any} value */
+  function fmtTokens(value) {
+    const n = Number(value);
+    if (!Number.isFinite(n) || n < 0) return "0";
+    if (n >= 10000) return `${(n / 1000).toFixed(1)}k`;
+    return String(Math.round(n));
+  }
+
+  /** 按当前会话渲染统计栏（stats 事件 / 会话切换驱动）；无数据留空。 */
+  function renderStats() {
+    const cid = store.state.currentCid;
+    const stats = cid ? store.statsOf(cid) : null;
+    statsBar.replaceChildren();
+    if (!stats || typeof stats !== "object") return;
+    // 缓存命中率：cache_rate null/缺省 → 该项隐藏
+    const cacheRate = stats.cache_rate;
+    if (cacheRate !== null && cacheRate !== undefined && Number.isFinite(Number(cacheRate))) {
+      const pct = `${Math.round(Number(cacheRate) * 100)}%`;
+      statsBar.appendChild(el("span", {
+        class: "sb-item sb-cache",
+        text: t("stats.cache", "缓存 {pct}").replace("{pct}", pct),
+      }));
+    }
+    // 上下文用量：有 max_context_tokens 用 {used}/{max}，否则仅 {used}
+    const contextTokens = stats.context_tokens;
+    if (contextTokens !== null && contextTokens !== undefined && Number.isFinite(Number(contextTokens))) {
+      const maxTokens = stats.max_context_tokens;
+      const label = (maxTokens !== null && maxTokens !== undefined && Number.isFinite(Number(maxTokens)) && Number(maxTokens) > 0)
+        ? t("stats.context", "上下文 {used}/{max}")
+          .replace("{used}", fmtTokens(contextTokens))
+          .replace("{max}", fmtTokens(maxTokens))
+        : t("stats.contextNoMax", "上下文 {used}").replace("{used}", fmtTokens(contextTokens));
+      statsBar.appendChild(el("span", { class: "sb-item sb-ctx", text: label }));
+    }
+  }
+
   /* ── 装配 ───────────────────────────────────────────── */
 
-  inner.append(previewBar, row, foot, fileInput);
+  inner.append(statsBar, previewBar, row, foot, fileInput);
   root.appendChild(inner);
   autoGrow();
   updateButtons();
+  renderStats();
 
   /** @param {Set<string>} topics */
   function onStoreChange(topics) {
     if (topics.has("stream") || topics.has("conversations") || topics.has("ui") || topics.has("messages")) {
       updateButtons();
+      renderStats(); // "stream"（stats 事件）/"ui"（切会话）等 topic 到达时同步统计栏
     }
   }
 
@@ -568,6 +684,8 @@ export function createComposer({ root, store, api, t }) {
     textarea.setAttribute("aria-label", placeholder);
     attachBtn.setAttribute("aria-label", t("composer.attach", "添加附件"));
     attachBtn.setAttribute("title", t("composer.attach", "添加附件"));
+    mergeBtn.setAttribute("aria-label", t("composer.mergeTip", "并入下一条（合并发送）"));
+    mergeBtn.setAttribute("title", t("composer.mergeTip", "并入下一条（合并发送）"));
     sendBtn.setAttribute("aria-label", t("composer.send", "发送"));
     sendBtn.setAttribute("title", t("composer.send", "发送"));
     stopBtn.setAttribute("aria-label", t("composer.stop", "停止"));
