@@ -183,11 +183,15 @@ export function createMessageFlow({ scrollEl, store, api, transport, t, onPinned
         onclick: () => openLightbox({ meta, api, t, canFetchOriginal }),
       });
       if (meta.preview) {
-        thumb.appendChild(el("img", { src: meta.preview, alt: meta.name || "image" }));
+        const img = el("img", { src: meta.preview, alt: meta.name || "image" });
+        // preview 加载失败（data URL 损坏等）：回退占位图标而非浏览器破图
+        img.addEventListener("error", () => {
+          img.replaceWith(el("span", { class: "ap-file-icon" }, icon("image", { size: 20 })));
+        }, { once: true });
+        thumb.appendChild(img);
       } else {
         // preview 缺失（如非图像素材）：占位图标而非空框
-        thumb.appendChild(el("span", { class: "ap-file-icon", style: { width: "100%", height: "100%" } },
-          icon("image", { size: 20 })));
+        thumb.appendChild(el("span", { class: "ap-file-icon" }, icon("image", { size: 20 })));
       }
       return thumb;
     }

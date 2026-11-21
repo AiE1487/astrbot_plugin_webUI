@@ -126,6 +126,19 @@ export function createComposer({ root, store, api, t }) {
     previewBar.classList.toggle("has-items", pending.size > 0);
   }
 
+  /**
+   * 缩略图 img。契约：preview 仅 image kind 是图片 data URL（text kind 是
+   * 内容摘要，绝不可作 img src）；加载失败回退占位图标而非浏览器破图。
+   * @param {{preview?: string, name?: string}} meta
+   */
+  function buildThumbImg(meta) {
+    const img = el("img", { class: "ap-thumb", src: meta.preview, alt: meta.name || "" });
+    img.addEventListener("error", () => {
+      img.replaceWith(el("span", { class: "ap-file-icon" }, icon("image", { size: 20 })));
+    }, { once: true });
+    return img;
+  }
+
   /** @param {string} key */
   function removePending(key) {
     const item = pending.get(key);
@@ -149,8 +162,8 @@ export function createComposer({ root, store, api, t }) {
     );
     const metaNode = /** @type {HTMLElement} */ (infoNode.querySelector(".ap-meta"));
     const chip = el("div", { class: "ap-chip" });
-    if (meta?.preview) {
-      chip.appendChild(el("img", { class: "ap-thumb", src: meta.preview, alt: meta.name || "" }));
+    if (meta?.kind === "image" && meta.preview) {
+      chip.appendChild(buildThumbImg(meta));
     } else {
       chip.appendChild(el("span", { class: "ap-file-icon" },
         icon(isImage ? "image" : "fileText", { size: 20 })));
@@ -197,9 +210,10 @@ export function createComposer({ root, store, api, t }) {
     if (item.meta) {
       const parts = [item.meta.mime || "", formatSize(Number(item.meta.size ?? 0))].filter(Boolean);
       item.metaNode.textContent = parts.join(" · ");
-      if (item.meta.preview && !item.chip.querySelector("img")) {
-        const img = el("img", { class: "ap-thumb", src: item.meta.preview, alt: item.meta.name || "" });
-        item.chip.insertBefore(img, item.chip.firstChild);
+      if (item.meta.kind === "image" && item.meta.preview && !item.chip.querySelector("img")) {
+        // 换入缩略图时回收上传期占位图标，避免双框
+        item.chip.querySelector(".ap-file-icon")?.remove();
+        item.chip.insertBefore(buildThumbImg(item.meta), item.chip.firstChild);
       }
       item.progressNode?.remove();
       item.progressNode = null;

@@ -1,5 +1,21 @@
 # 更新日志
 
+## v0.4.1（2026-11-21）
+
+修复附件预览破图（composer 把 text 附件的 preview 内容摘要当图片 URL 渲染）。
+
+- **composer 预览条**：缩略图 img 仅在 `kind === "image"` 且有 preview 时渲染
+  （契约中 text 附件 preview 是前 500 字内容摘要，此前被塞进 `<img src>` 触发
+  浏览器破图 + 文件名 alt 换行）；img 换入时回收上传期占位图标，消除双框；
+  preview 加载失败回退占位图标而非破图（`buildThumbImg` onerror）。
+- **消息气泡缩略图**：`.attach-thumb` img 加载失败同样回退占位图标；补
+  `.attach-thumb .ap-file-icon` 居中样式（原回退 span 只有内联宽高、无样式）。
+- **灯箱**：text 附件点击改为文本块呈现（`pre.lb-text`，此前同样把内容摘要
+  当 img src 破图）；图片灯箱占位/原图失败状态机——preview 失败等原图裁决，
+  原图也失败才回退占位图标，preview 存活时原图失败不打断预览。
+- 自测 342 项断言全过；浏览器 mock 实测：text chip 无破图、image chip 单缩略
+  图、灯箱三态（文本块/正常图/损坏回退）全部符合预期。
+
 ## v0.4.0（2026-11-21）
 
 多功能特性集（前后端，7 项）：多轮防抖合并发送、LLM 媒体实时上屏、后台回复
